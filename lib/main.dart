@@ -86,7 +86,9 @@ class _HomePageState extends State<HomePage> {
         urlController.clear();
       });
     } catch (e) {
-      showError('Could not select video:\n\n$e');
+      showError(
+        'Could not select video:\n\n$e',
+      );
     }
   }
 
@@ -108,15 +110,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> testConnection() async {
-    if (testingConnection || loading) return;
+    if (testingConnection || loading) {
+      return;
+    }
 
     setState(() {
       testingConnection = true;
     });
 
-    final results = <String>[];
+    final List<String> results = [];
 
-    // TEST 1 — Internet
+    // Internet test
     try {
       final response = await http
           .get(
@@ -127,29 +131,26 @@ class _HomePageState extends State<HomePage> {
           );
 
       results.add(
-        '🌐 Internet: OK\n'
+        'INTERNET: OK\n'
         'HTTP ${response.statusCode}',
       );
     } on SocketException catch (e) {
       results.add(
-        '❌ Internet: FAILED\n'
-        '$e',
+        'INTERNET: FAILED\n$e',
       );
     } on TimeoutException {
       results.add(
-        '❌ Internet: TIMEOUT',
+        'INTERNET: TIMEOUT',
       );
     } catch (e) {
       results.add(
-        '❌ Internet: FAILED\n'
-        '$e',
+        'INTERNET: FAILED\n$e',
       );
     }
 
-    // TEST 2 — DNS
+    // DNS test
     try {
-      final addresses =
-          await InternetAddress.lookup(
+      final addresses = await InternetAddress.lookup(
         'clipai-app.onrender.com',
       ).timeout(
         const Duration(seconds: 10),
@@ -157,31 +158,29 @@ class _HomePageState extends State<HomePage> {
 
       if (addresses.isNotEmpty) {
         results.add(
-          '🔎 DNS: OK\n'
+          'DNS: OK\n'
           '${addresses.map((e) => e.address).join(', ')}',
         );
       } else {
         results.add(
-          '❌ DNS: NO ADDRESS FOUND',
+          'DNS: NO ADDRESS FOUND',
         );
       }
     } on SocketException catch (e) {
       results.add(
-        '❌ DNS: FAILED\n'
-        '$e',
+        'DNS: FAILED\n$e',
       );
     } on TimeoutException {
       results.add(
-        '❌ DNS: TIMEOUT',
+        'DNS: TIMEOUT',
       );
     } catch (e) {
       results.add(
-        '❌ DNS: FAILED\n'
-        '$e',
+        'DNS: FAILED\n$e',
       );
     }
 
-    // TEST 3 — Render
+    // Render test
     try {
       final response = await http
           .get(
@@ -192,39 +191,43 @@ class _HomePageState extends State<HomePage> {
           );
 
       results.add(
-        '🟢 Render: OK\n'
+        'RENDER: OK\n'
         'HTTP ${response.statusCode}\n\n'
         '${response.body}',
       );
     } on SocketException catch (e) {
       results.add(
-        '❌ Render: FAILED\n'
-        '$e',
+        'RENDER: FAILED\n$e',
       );
     } on TimeoutException {
       results.add(
-        '❌ Render: TIMEOUT',
+        'RENDER: TIMEOUT',
       );
     } catch (e) {
       results.add(
-        '❌ Render: FAILED\n'
-        '$e',
+        'RENDER: FAILED\n$e',
       );
     }
 
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
 
     setState(() {
       testingConnection = false;
     });
 
     showError(
-      results.join('\n\n--------------------\n\n'),
+      results.join(
+        '\n\n--------------------\n\n',
+      ),
     );
   }
 
   Future<void> analyzeVideo() async {
-    if (loading || testingConnection) return;
+    if (loading || testingConnection) {
+      return;
+    }
 
     final youtubeUrl =
         urlController.text.trim();
@@ -281,7 +284,9 @@ class _HomePageState extends State<HomePage> {
         streamedResponse,
       );
 
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       if (response.statusCode >= 200 &&
           response.statusCode < 300) {
@@ -319,7 +324,9 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } on SocketException catch (e) {
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         loading = false;
@@ -332,7 +339,9 @@ class _HomePageState extends State<HomePage> {
         '$e',
       );
     } on TimeoutException {
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         loading = false;
@@ -343,7 +352,9 @@ class _HomePageState extends State<HomePage> {
         'The server took too long to respond.',
       );
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
         loading = false;
@@ -356,13 +367,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   void showError(String message) {
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
 
     showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text('ClipAI Diagnostics'),
+          title: const Text(
+            'ClipAI Diagnostics',
+          ),
           content: SingleChildScrollView(
             child: SelectableText(message),
           ),
@@ -647,7 +662,9 @@ class _HomePageState extends State<HomePage> {
                   height: 1.1,
                 ),
               ),
+
               const SizedBox(height: 8),
+
               Text(
                 'AI finds the best moments automatically.',
                 style: TextStyle(
@@ -656,6 +673,7 @@ class _HomePageState extends State<HomePage> {
                   fontSize: 15,
                 ),
               ),
+
               const SizedBox(height: 12),
 
               SizedBox(
@@ -797,35 +815,25 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         )
-                      : const Text(
-                          'Find Best Clips',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-                ),
-              ),
-
-              if (clips.isNotEmpty) ...[
-                const SizedBox(height: 30),
-                const Text(
-                  'Best Clips',
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight:
-                        FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ...List.generate(
-                  clips.length,
-                  (index) {
-                    return buildResultCard(
-                      clips[index],
-                      index,
-                    );
-                  },
-                ),
-              ]
+                      : testingConnection
+                          ? const Row(
+                              mainAxisAlignment:
+                                  MainAxisAlignment
+                                      .center,
+                              children: [
+                                SizedBox(
+                                  width: 21,
+                                  height: 21,
+                                  child:
+                                      CircularProgressIndicator(
+                                    strokeWidth: 2.5,
+                                  ),
+                                ),
+                                SizedBox(width: 12),
+                                Text(
+                                  'Connecting...',
+                                ),
+                              ],
+                            )
+                          : const Text(
+        

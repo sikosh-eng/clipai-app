@@ -120,7 +120,6 @@ class _HomePageState extends State<HomePage> {
 
     final List<String> results = [];
 
-    // Internet test
     try {
       final response = await http
           .get(
@@ -148,9 +147,9 @@ class _HomePageState extends State<HomePage> {
       );
     }
 
-    // DNS test
     try {
-      final addresses = await InternetAddress.lookup(
+      final addresses =
+          await InternetAddress.lookup(
         'clipai-app.onrender.com',
       ).timeout(
         const Duration(seconds: 10),
@@ -180,7 +179,6 @@ class _HomePageState extends State<HomePage> {
       );
     }
 
-    // Render test
     try {
       final response = await http
           .get(
@@ -246,13 +244,9 @@ class _HomePageState extends State<HomePage> {
     });
 
     try {
-      final uri =
-          Uri.parse('$serverUrl/api/analyze');
-
-      final request =
-          http.MultipartRequest(
+      final request = http.MultipartRequest(
         'POST',
-        uri,
+        Uri.parse('$serverUrl/api/analyze'),
       );
 
       request.fields['numberOfClips'] =
@@ -615,6 +609,59 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget buildMainButton() {
+    String text = 'Find Best Clips';
+    Widget? icon;
+
+    if (loading) {
+      text = 'Finding best clips...';
+      icon = const SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(
+          strokeWidth: 2.5,
+        ),
+      );
+    } else if (testingConnection) {
+      text = 'Connecting...';
+      icon = const SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(
+          strokeWidth: 2.5,
+        ),
+      );
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      height: 56,
+      child: FilledButton(
+        onPressed:
+            loading || testingConnection
+                ? null
+                : analyzeVideo,
+        child: Row(
+          mainAxisAlignment:
+              MainAxisAlignment.center,
+          children: [
+            if (icon != null) ...[
+              icon,
+              const SizedBox(width: 12),
+            ],
+            Text(
+              text,
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -786,54 +833,36 @@ class _HomePageState extends State<HomePage> {
 
               const SizedBox(height: 24),
 
-              SizedBox(
-                width: double.infinity,
-                height: 56,
-                child: FilledButton(
-                  onPressed:
-                      loading ||
-                              testingConnection
-                          ? null
-                          : analyzeVideo,
-                  child: loading
-                      ? const Row(
-                          mainAxisAlignment:
-                              MainAxisAlignment
-                                  .center,
-                          children: [
-                            SizedBox(
-                              width: 21,
-                              height: 21,
-                              child:
-                                  CircularProgressIndicator(
-                                strokeWidth: 2.5,
-                              ),
-                            ),
-                            SizedBox(width: 12),
-                            Text(
-                              'Finding best clips...',
-                            ),
-                          ],
-                        )
-                      : testingConnection
-                          ? const Row(
-                              mainAxisAlignment:
-                                  MainAxisAlignment
-                                      .center,
-                              children: [
-                                SizedBox(
-                                  width: 21,
-                                  height: 21,
-                                  child:
-                                      CircularProgressIndicator(
-                                    strokeWidth: 2.5,
-                                  ),
-                                ),
-                                SizedBox(width: 12),
-                                Text(
-                                  'Connecting...',
-                                ),
-                              ],
-                            )
-                          : const Text(
-        
+              buildMainButton(),
+
+              if (clips.isNotEmpty) ...[
+                const SizedBox(height: 30),
+
+                const Text(
+                  'Best Clips',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight:
+                        FontWeight.w800,
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                ...List.generate(
+                  clips.length,
+                  (index) {
+                    return buildResultCard(
+                      clips[index],
+                      index,
+                    );
+                  },
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

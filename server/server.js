@@ -4,6 +4,7 @@ import multer from "multer";
 import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+import ytDlp from "yt-dlp-exec";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -35,6 +36,10 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+/* =========================
+   HOME
+========================= */
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -42,279 +47,481 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/api/analyze", upload.single("video"), async (req, res) => {
-  let videoPath = null;
-  let audioPath = null;
+/* =========================
+   ANALYZE
+========================= */
 
-  try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({
-        error: "OPENAI_API_KEY is not configured"
-      });
-    }
+app.post(
+  "/api/analyze",
+  upload.single("video"),
+  async (req, res) => {
 
-    if (!req.file) {
-      return res.status(400).json({
-        error: "Video file is required"
-      });
-    }
+    let videoPath = null;
+    let audioPath = null;
+    let downloadedFromUrl = false;
 
-    videoPath = req.file.path;
+    try {
 
-    audioPath = path.join(
-      uploadDir,
-      `${req.file.filename}.mp3`
-    );
+      if (!process.env.OPENAI_API_KEY) {
+        return res.status(500).json({
+          error: "OPENAI_API_KEY is not configured"
+        });
+      }
 
-    console.log("Extracting audio...");
+      const videoUrl =
+        typeof req.body?.url === "string"
+          ? req.body.url.trim()
+          : "";
 
-    await extractAudio(videoPath, audioPath);
+      /* =========================
+         GET VIDEO
+      ========================= */
 
-    console.log("Transcribing video...");
+      if (req.file) {
 
-    const transcription =
-      await openai.audio.transcriptions.create({
-        file: fs.createReadStream(audioPath),
-        model: "gpt-transcribe",
-        response_format: "verbose_json",
-        timestamp_granularities: ["segment"]
-      });
+        console.log("Using uploaded video");
 
-    const segments = (transcription.segments || []).map(
-      (segment) => ({
-        start: Number(segment.start),
-        end: Number(segment.end),
-        text: segment.text.trim()
-      })
-    );
+        videoPath = req.file.path;
 
-    if (!segments.length) {
-      throw new Error(
-        "No speech segments were detected"
+      } else if (videoUrl) {
+
+        console.log("Video URL received");
+
+        if (!isAllowedVideoUrl(videoUrl)) {
+          return res.status(400).json({
+            error:
+              "Only supported video URLs are allowed."
+          });
+        }
+
+        const downloadedPath =
+          await downloadVideo(videoUrl);
+
+        videoPath = downloadedPath;
+        downloadedFromUrl = true;
+
+      } else {
+
+        return res.status(400).json({
+          error:
+            "Upload a video or provide a video URL."
+        });
+      }
+
+      /* =========================
+         EXTRACT AUDIO
+      ========================= */
+
+      audioPath = path.join(
+        uploadDir,
+        `audio-${Date.now()}.mp3`
       );
-    }
 
-    console.log(
-      `Found ${segments.length} transcript segments`
-    );
+      console.log("Extracting audio...");
 
-    const numberOfClips =
-      Number(req.body.numberOfClips || 5);
+      await extractAudio(
+        videoPath,
+        audioPath
+      );
 
-    const transcriptForAI = segments
-      .map(
-        (s, i) =>
-          `[${i}] ${s.start.toFixed(2)}-${s.end.toFixed(2)}: ${s.text}`
-      )
-      .join("\n");
+      /* =========================
+         TRANSCRIPTION
+      ========================= */
 
-    console.log(
-      "AI is selecting the best moments..."
-    );
+      console.log("Transcribing video...");
 
-    const aiResponse =
-      await openai.responses.create({
-        model: "gpt-5.6",
-        input: [
-          {
-            role: "system",
-            content: `
+      const transcription =
+        await openai.audio.transcriptions.create({
+          file: fs.createReadStream(audioPath),
+          model: "gpt-transcribe",
+          response_format: "verbose_json",
+          timestamp_granularities: ["segment"]
+        });
+
+      const segments =
+        (transcription.segments || [])
+          .map((segment) => ({
+            start: Number(segment.start),
+            end: Number(segment.end),
+            text: String(segment.text || "").trim()
+          }))
+          .filter(
+            (segment) =>
+              Number.isFinite(segment.start) &&
+              Number.isFinite(segment.end) &&
+              segment.end > segment.start &&
+              segment.text.length > 0
+          );
+
+      if (!segments.length) {
+        throw new Error(
+          "No speech segments were detected."
+        );
+      }
+
+      console.log(
+        `Found ${segments.length} transcript segments`
+      );
+
+      /* =========================
+         NUMBER OF CLIPS
+      ========================= */
+
+      let numberOfClips =
+        Number(req.body?.numberOfClips || 5);
+
+      if (
+        !Number.isFinite(numberOfClips) ||
+        numberOfClips < 1
+      ) {
+        numberOfClips = 5;
+      }
+
+      numberOfClips =
+        Math.min(numberOfClips, 15);
+
+      /* =========================
+         TRANSCRIPT FOR AI
+      ========================= */
+
+      const transcriptForAI =
+        segments
+          .map(
+            (s, i) =>
+              `[${i}] ${s.start.toFixed(2)}-${s.end.toFixed(2)}: ${s.text}`
+          )
+          .join("\n");
+
+      console.log(
+        "AI is selecting the best moments..."
+      );
+
+      /* =========================
+         AI CLIP SELECTION
+      ========================= */
+
+      const aiResponse =
+        await openai.responses.create({
+
+          model: "gpt-5.6-sol",
+
+          input: [
+
+            {
+              role: "system",
+
+              content: `
 You are an expert short-form video editor.
 
-Find the most viral and engaging moments
-from the supplied transcript.
+Your job is to find the strongest moments
+from a long-form video transcript.
+
+Choose moments that have high potential
+for Shorts/Reels/TikTok.
 
 Look for:
 
-- strong hooks
+- extremely strong hooks
 - surprising statements
-- curiosity
-- emotion
+- emotional moments
 - useful information
-- controversial statements
-- interesting stories
+- curiosity
+- controversy
+- storytelling
+- unexpected facts
+- strong opinions
+- funny moments
 - strong payoffs
+- moments that make viewers want to keep watching
 
 Avoid:
 
 - greetings
 - introductions without value
 - filler
-- long pauses
-- repetitive content
+- repetitive statements
+- long explanations without a payoff
 - incomplete thoughts
+- moments that need missing context
 
 Each clip should normally be
-20 to 60 seconds long.
+20-60 seconds.
 
-Start slightly before the hook
+A clip may be slightly shorter or longer
+if necessary for a complete thought.
+
+Start slightly before the important statement
 when necessary.
 
 End after the payoff.
 
-Never invent timestamps.
-
-Use only timestamps available
+Use ONLY timestamps contained
 in the transcript.
+
+NEVER invent timestamps.
 
 Clips must not overlap.
 
-Return the best clips first.
+Return the strongest clips first.
+
+Score each clip from 0 to 100.
 `
-          },
-          {
-            role: "user",
-            content: `
-Find the ${numberOfClips} best clips.
+            },
+
+            {
+              role: "user",
+
+              content: `
+Find the ${numberOfClips} strongest clips.
 
 TRANSCRIPT:
 
 ${transcriptForAI}
 `
-          }
-        ],
-        text: {
-          format: {
-            type: "json_schema",
-            name: "clip_selection",
-            strict: true,
-            schema: {
-              type: "object",
-              properties: {
-                clips: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      start: {
-                        type: "number"
+            }
+          ],
+
+          text: {
+            format: {
+              type: "json_schema",
+
+              name: "clip_selection",
+
+              strict: true,
+
+              schema: {
+
+                type: "object",
+
+                properties: {
+
+                  clips: {
+
+                    type: "array",
+
+                    items: {
+
+                      type: "object",
+
+                      properties: {
+
+                        start: {
+                          type: "number"
+                        },
+
+                        end: {
+                          type: "number"
+                        },
+
+                        title: {
+                          type: "string"
+                        },
+
+                        score: {
+                          type: "number"
+                        },
+
+                        reason: {
+                          type: "string"
+                        }
+
                       },
-                      end: {
-                        type: "number"
-                      },
-                      title: {
-                        type: "string"
-                      },
-                      score: {
-                        type: "number"
-                      },
-                      reason: {
-                        type: "string"
-                      }
-                    },
-                    required: [
-                      "start",
-                      "end",
-                      "title",
-                      "score",
-                      "reason"
-                    ],
-                    additionalProperties: false
+
+                      required: [
+                        "start",
+                        "end",
+                        "title",
+                        "score",
+                        "reason"
+                      ],
+
+                      additionalProperties: false
+                    }
                   }
-                }
-              },
-              required: ["clips"],
-              additionalProperties: false
+                },
+
+                required: [
+                  "clips"
+                ],
+
+                additionalProperties: false
+              }
             }
           }
-        }
-      });
+        });
 
-    const result =
-      JSON.parse(aiResponse.output_text);
+      const result =
+        JSON.parse(
+          aiResponse.output_text
+        );
 
-    console.log(
-      `AI selected ${result.clips.length} clips`
-    );
-
-    const clips = [];
-
-    for (
-      let i = 0;
-      i < result.clips.length;
-      i++
-    ) {
-      const clip = result.clips[i];
-
-      const start = Math.max(
-        0,
-        Number(clip.start)
+      console.log(
+        `AI selected ${result.clips.length} clips`
       );
 
-      const end = Number(clip.end);
+      /* =========================
+         CREATE CLIPS
+      ========================= */
 
-      if (
-        !Number.isFinite(start) ||
-        !Number.isFinite(end) ||
-        end <= start ||
-        end - start < 5
+      const clips = [];
+
+      for (
+        let i = 0;
+        i < result.clips.length;
+        i++
       ) {
-        continue;
+
+        const clip = result.clips[i];
+
+        const start =
+          Math.max(
+            0,
+            Number(clip.start)
+          );
+
+        const end =
+          Number(clip.end);
+
+        if (
+          !Number.isFinite(start) ||
+          !Number.isFinite(end) ||
+          end <= start ||
+          end - start < 5
+        ) {
+          continue;
+        }
+
+        const duration =
+          end - start;
+
+        const outputFile =
+          path.join(
+            outputDir,
+            `${Date.now()}-clip-${i + 1}.mp4`
+          );
+
+        console.log(
+          `Creating clip ${i + 1}: ${start}s - ${end}s`
+        );
+
+        await createClip(
+          videoPath,
+          outputFile,
+          start,
+          duration
+        );
+
+        clips.push({
+
+          id: i + 1,
+
+          title:
+            clip.title ||
+            `Best Moment ${i + 1}`,
+
+          score:
+            Number(clip.score) || 0,
+
+          reason:
+            clip.reason || "",
+
+          start,
+
+          end,
+
+          url:
+            `/outputs/${path.basename(
+              outputFile
+            )}`
+        });
       }
 
-      const outputFile = path.join(
-        outputDir,
-        `${req.file.filename}-clip-${i + 1}.mp4`
-      );
+      /* =========================
+         RESPONSE
+      ========================= */
 
-      await createClip(
-        videoPath,
-        outputFile,
-        start,
-        end - start
-      );
+      res.json({
 
-      clips.push({
-        id: i + 1,
-        title: clip.title,
-        score: clip.score,
-        reason: clip.reason,
-        start,
-        end,
-        url:
-          `/outputs/${path.basename(outputFile)}`
+        success: true,
+
+        transcript:
+          transcription.text || "",
+
+        clips
       });
-    }
 
-    res.json({
-      success: true,
-      transcript: transcription.text,
-      clips
-    });
+    } catch (error) {
 
-  } catch (error) {
+      console.error(
+        "ANALYZE ERROR:",
+        error
+      );
 
-    console.error(error);
+      res.status(500).json({
 
-    res.status(500).json({
-      success: false,
-      error:
-        error.message ||
-        "Video processing failed"
-    });
+        success: false,
 
-  } finally {
+        error:
+          error?.message ||
+          "Video processing failed."
+      });
 
-    if (
-      audioPath &&
-      fs.existsSync(audioPath)
-    ) {
-      fs.unlinkSync(audioPath);
-    }
+    } finally {
 
-    if (
-      videoPath &&
-      fs.existsSync(videoPath)
-    ) {
-      fs.unlinkSync(videoPath);
+      /* =========================
+         CLEAN TEMP FILES
+      ========================= */
+
+      if (
+        audioPath &&
+        fs.existsSync(audioPath)
+      ) {
+
+        try {
+          fs.unlinkSync(audioPath);
+        } catch (_) {}
+
+      }
+
+      if (
+        videoPath &&
+        downloadedFromUrl &&
+        fs.existsSync(videoPath)
+      ) {
+
+        try {
+          fs.unlinkSync(videoPath);
+        } catch (_) {}
+
+      }
+
+      if (
+        videoPath &&
+        req.file &&
+        fs.existsSync(videoPath)
+      ) {
+
+        try {
+          fs.unlinkSync(videoPath);
+        } catch (_) {}
+
+      }
     }
   }
-});
+);
+
+/* =========================
+   OUTPUTS
+========================= */
 
 app.use(
   "/outputs",
   express.static(outputDir)
 );
+
+/* =========================
+   SERVER
+========================= */
 
 const PORT =
   process.env.PORT || 3000;
@@ -323,32 +530,172 @@ app.listen(
   PORT,
   "0.0.0.0",
   () => {
+
     console.log(
       `ClipAI server running on port ${PORT}`
     );
+
   }
 );
+
+/* =========================
+   URL VALIDATION
+========================= */
+
+function isAllowedVideoUrl(url) {
+
+  try {
+
+    const parsed =
+      new URL(url);
+
+    const hostname =
+      parsed.hostname
+        .toLowerCase()
+        .replace(/^www\./, "");
+
+    return (
+      hostname === "youtube.com" ||
+      hostname === "youtu.be" ||
+      hostname === "m.youtube.com"
+    );
+
+  } catch (_) {
+
+    return false;
+
+  }
+}
+
+/* =========================
+   DOWNLOAD VIDEO FROM URL
+========================= */
+
+async function downloadVideo(url) {
+
+  const id =
+    `download-${Date.now()}`;
+
+  const outputTemplate =
+    path.join(
+      uploadDir,
+      `${id}.%(ext)s`
+    );
+
+  console.log(
+    "Downloading authorized video..."
+  );
+
+  await ytDlp(
+    url,
+    {
+
+      output:
+        outputTemplate,
+
+      format:
+        "best[height<=720]/best",
+
+      mergeOutputFormat:
+        "mp4",
+
+      noPlaylist:
+        true,
+
+      noWarnings:
+        true,
+
+      quiet:
+        true,
+
+      restrictFilenames:
+        true,
+
+      ffmpegLocation:
+        path.dirname(ffmpegPath)
+
+    }
+  );
+
+  const files =
+    fs.readdirSync(uploadDir);
+
+  const downloaded =
+    files.find(
+      (file) =>
+        file.startsWith(`${id}.`)
+    );
+
+  if (!downloaded) {
+
+    throw new Error(
+      "Could not download the video."
+    );
+
+  }
+
+  const downloadedPath =
+    path.join(
+      uploadDir,
+      downloaded
+    );
+
+  console.log(
+    `Video downloaded: ${downloadedPath}`
+  );
+
+  return downloadedPath;
+}
+
+/* =========================
+   EXTRACT AUDIO
+========================= */
 
 function extractAudio(
   video,
   audio
 ) {
+
   return new Promise(
     (resolve, reject) => {
 
       ffmpeg(video)
+
         .noVideo()
-        .audioCodec("libmp3lame")
-        .audioFrequency(16000)
-        .audioChannels(1)
+
+        .audioCodec(
+          "libmp3lame"
+        )
+
+        .audioFrequency(
+          16000
+        )
+
+        .audioChannels(
+          1
+        )
+
         .format("mp3")
-        .on("end", resolve)
-        .on("error", reject)
+
+        .on(
+          "end",
+          resolve
+        )
+
+        .on(
+          "error",
+          reject
+        )
+
         .save(audio);
 
     }
   );
 }
+
+/* =========================
+   CREATE CLIP
+========================= */
 
 function createClip(
   video,
@@ -356,26 +703,53 @@ function createClip(
   start,
   duration
 ) {
+
   return new Promise(
     (resolve, reject) => {
 
       ffmpeg(video)
-        .setStartTime(start)
-        .setDuration(duration)
-        .videoCodec("libx264")
-        .audioCodec("aac")
+
+        .setStartTime(
+          start
+        )
+
+        .setDuration(
+          duration
+        )
+
+        .videoCodec(
+          "libx264"
+        )
+
+        .audioCodec(
+          "aac"
+        )
+
         .outputOptions([
+
           "-preset",
           "veryfast",
+
           "-crf",
           "23",
+
           "-movflags",
           "+faststart"
+
         ])
-        .on("end", resolve)
-        .on("error", reject)
+
+        .on(
+          "end",
+          resolve
+        )
+
+        .on(
+          "error",
+          reject
+        )
+
         .save(output);
 
     }
   );
-            }
+}

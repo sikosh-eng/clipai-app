@@ -1,11 +1,8 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-
-const String serverUrl = 'https://clipai-app.onrender.com';
 
 void main() {
   runApp(const ClipAIApp());
@@ -17,13 +14,13 @@ class ClipAIApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      debugShowCheckedModeBanner: false,
       title: 'ClipAI',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF08080B),
+        scaffoldBackgroundColor: const Color(0xFF08080A),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFE91E63),
+          seedColor: const Color(0xFF7C5CFF),
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
@@ -41,21 +38,20 @@ class ClipMakerPage extends StatefulWidget {
 }
 
 class _ClipMakerPageState extends State<ClipMakerPage> {
-  final TextEditingController urlController =
-      TextEditingController();
+  static const String serverUrl = 'https://clipai-app.onrender.com';
+
+  final TextEditingController urlController = TextEditingController();
 
   PlatformFile? selectedVideo;
 
   String numberOfClips = '5 clips';
-  String format = '9:16 Shorts';
-  String captions = 'Bold';
+  String videoFormat = '9:16 Shorts';
+  String captionsStyle = 'Animated';
 
   bool isAnalyzing = false;
-  double progress = 0;
-
-  String statusText = '';
 
   List<dynamic> clips = [];
+  String? errorMessage;
 
   @override
   void dispose() {
@@ -64,60 +60,46 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
   }
 
   Future<void> pickVideo() async {
-    final result = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: [
-        'mp4',
-        'mov',
-        'webm',
-        'mkv',
-      ],
-    );
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.video,
+        allowMultiple: false,
+      );
 
-    if (result == null || result.files.isEmpty) {
-      return;
+      if (result == null || result.files.isEmpty) {
+        return;
+      }
+
+      setState(() {
+        selectedVideo = result.files.first;
+        urlController.clear();
+        errorMessage = null;
+        clips = [];
+      });
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Could not select video: $e';
+      });
     }
-
-    setState(() {
-      selectedVideo = result.files.first;
-      urlController.clear();
-      clips = [];
-    });
-  }
-
-  void clearVideo() {
-    setState(() {
-      selectedVideo = null;
-    });
   }
 
   Future<void> analyzeVideo() async {
     final url = urlController.text.trim();
 
-    final hasUrl = url.isNotEmpty;
-    final hasFile =
-        selectedVideo != null &&
-        selectedVideo!.path != null;
-
-    if (!hasUrl && !hasFile) {
-      showMessage(
-        'Paste a video URL or choose a video file.',
-      );
+    if (selectedVideo == null && url.isEmpty) {
+      showMessage('Upload a video or paste a YouTube URL.');
       return;
     }
 
-    if (hasUrl && !isValidYouTubeUrl(url)) {
-      showMessage(
-        'Please enter a valid YouTube URL.',
-      );
+    if (url.isNotEmpty && !isYouTubeUrl(url)) {
+      showMessage('Please enter a valid YouTube URL.');
       return;
     }
 
     setState(() {
       isAnalyzing = true;
-      progress = 0.05;
+      errorMessage = null;
       clips = [];
-      statusText = 'Preparing video...';
     });
 
     try {
@@ -126,17 +108,17 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
         Uri.parse('$serverUrl/api/analyze'),
       );
 
-      /*
-       * URL MODE
-       */
-      if (hasUrl) {
+      request.fields['numberOfClips'] =
+          numberOfClips.split(' ').first;
+
+      request.fields['format'] = videoFormat;
+      request.fields['captions'] = captionsStyle;
+
+      if (url.isNotEmpty) {
         request.fields['url'] = url;
       }
 
-      /*
-       * FILE MODE
-       */
-      if (hasFile) {
+      if (selectedVideo != null && selectedVideo!.path != null) {
         request.files.add(
           await http.MultipartFile.fromPath(
             'video',
@@ -146,100 +128,76 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
         );
       }
 
-      request.fields['numberOfClips'] =
-          numberOfClips.split(' ').first;
-
-      request.fields['format'] = format;
-      request.fields['captions'] = captions;
-
-      setState(() {
-        progress = 0.12;
-        statusText = hasUrl
-            ? 'Getting your video...'
-            : 'Uploading your video...';
-      });
-
-      final streamedResponse =
-          await request.send();
-
-      setState(() {
-        progress = 0.70;
-        statusText =
-            'AI is finding the best moments...';
-      });
-
-      final response =
-          await http.Response.fromStream(
+      final streamedResponse = await request.send();
+      final response = await http.Response.fromStream(
         streamedResponse,
       );
 
-      setState(() {
-        progress = 0.90;
-        statusText = 'Creating your clips...';
-      });
-
-      if (response.statusCode >= 200 &&
-          response.statusCode < 300) {
-        final data = jsonDecode(response.body);
-
-        final receivedClips =
-            data['clips'] ?? [];
-
-        setState(() {
-          clips = receivedClips;
-          progress = 1.0;
-          isAnalyzing = false;
-          statusText = 'Finished!';
-        });
-
-        showMessage(
-          'Done! Found ${clips.length} clips.',
-        );
-      } else {
-        String errorMessage =
+      if (response.statusCode < 200 ||
+          response.statusCode >= 300) {
+        String message =
             'Server error: ${response.statusCode}';
 
         try {
-          final data =
-              jsonDecode(response.body);
+          final data = jsonDecode(response.body);
 
-          if (data['error'] != null) {
-            errorMessage =
-                data['error'].toString();
+          if (data is Map && data['error'] != null) {
+            message = data['error'].toString();
           }
         } catch (_) {}
 
-        setState(() {
-          isAnalyzing = false;
-          statusText = '';
-        });
-
-        showMessage(errorMessage);
+        throw Exception(message);
       }
-    } catch (error) {
-      setState(() {
-        isAnalyzing = false;
-        statusText = '';
-      });
+
+      final data = jsonDecode(response.body);
+
+      if (data is! Map) {
+        throw Exception('Invalid server response.');
+      }
+
+      final returnedClips = data['clips'];
+
+      if (returnedClips is List) {
+        setState(() {
+          clips = returnedClips;
+        });
+      }
+
+      if (clips.isEmpty) {
+        throw Exception(
+          'AI could not find suitable clips.',
+        );
+      }
 
       showMessage(
-        'Connection error. Please try again.',
+        'AI found ${clips.length} clips.',
       );
+    } catch (e) {
+      setState(() {
+        errorMessage = e
+            .toString()
+            .replaceFirst('Exception: ', '');
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          isAnalyzing = false;
+        });
+      }
     }
   }
 
-  bool isValidYouTubeUrl(String value) {
+  bool isYouTubeUrl(String value) {
     try {
       final uri = Uri.parse(value);
 
-      final host =
-          uri.host.toLowerCase();
+      final host = uri.host
+          .toLowerCase()
+          .replaceFirst('www.', '');
 
       return host == 'youtube.com' ||
-          host == 'www.youtube.com' ||
-          host == 'm.youtube.com' ||
           host == 'youtu.be' ||
-          host == 'www.youtu.be';
+          host == 'm.youtube.com';
     } catch (_) {
       return false;
     }
@@ -248,12 +206,284 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
   void showMessage(String message) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context)
-        .showSnackBar(
+    ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
-        behavior:
-            SnackBarBehavior.floating,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Widget buildDropdown({
+    required String label,
+    required String value,
+    required List<String> items,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 13,
+            color: Colors.white70,
+          ),
+        ),
+        const SizedBox(height: 8),
+        DropdownButtonFormField<String>(
+          value: value,
+          isExpanded: true,
+          decoration: InputDecoration(
+            filled: true,
+            fillColor: const Color(0xFF15151A),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: BorderSide.none,
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 14,
+            ),
+          ),
+          dropdownColor: const Color(0xFF19191F),
+          items: items.map((item) {
+            return DropdownMenuItem<String>(
+              value: item,
+              child: Text(item),
+            );
+          }).toList(),
+          onChanged: onChanged,
+        ),
+      ],
+    );
+  }
+
+  Widget buildUploadCard() {
+    return InkWell(
+      onTap: pickVideo,
+      borderRadius: BorderRadius.circular(20),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(
+          horizontal: 20,
+          vertical: 28,
+        ),
+        decoration: BoxDecoration(
+          color: const Color(0xFF121217),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: Colors.white12,
+          ),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 58,
+              height: 58,
+              decoration: BoxDecoration(
+                color: const Color(0xFF201B35),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: const Icon(
+                Icons.video_library_rounded,
+                color: Color(0xFF9B7CFF),
+                size: 28,
+              ),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              selectedVideo == null
+                  ? 'Upload a video'
+                  : selectedVideo!.name,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              selectedVideo == null
+                  ? 'MP4, MOV or WebM'
+                  : 'Video selected',
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 13,
+              ),
+            ),
+            const SizedBox(height: 16),
+            OutlinedButton(
+              onPressed: pickVideo,
+              child: const Text('Choose video'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget buildUrlCard() {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121217),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: Colors.white12,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(
+                Icons.link_rounded,
+                color: Color(0xFF9B7CFF),
+              ),
+              SizedBox(width: 10),
+              Text(
+                'Video URL',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          TextField(
+            controller: urlController,
+            onChanged: (_) {
+              if (selectedVideo != null) {
+                setState(() {
+                  selectedVideo = null;
+                });
+              }
+            },
+            decoration: InputDecoration(
+              hintText: 'Paste YouTube URL',
+              filled: true,
+              fillColor: const Color(0xFF09090C),
+              prefixIcon: const Icon(
+                Icons.smart_display_outlined,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildClipCard(dynamic clip, int index) {
+    final title =
+        clip is Map ? clip['title']?.toString() : null;
+
+    final score =
+        clip is Map ? clip['score']?.toString() : null;
+
+    final reason =
+        clip is Map ? clip['reason']?.toString() : null;
+
+    final start =
+        clip is Map ? clip['start']?.toString() : null;
+
+    final end =
+        clip is Map ? clip['end']?.toString() : null;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121217),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: Colors.white10,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF211A39),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Center(
+                  child: Text(
+                    '${index + 1}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  title ?? 'Best Moment ${index + 1}',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+              if (score != null)
+                Text(
+                  '$score/100',
+                  style: const TextStyle(
+                    color: Color(0xFF9B7CFF),
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (reason != null && reason.isNotEmpty)
+            Text(
+              reason,
+              style: const TextStyle(
+                color: Colors.white60,
+                height: 1.4,
+              ),
+            ),
+          const SizedBox(height: 12),
+          if (start != null && end != null)
+            Text(
+              '$start s → $end s',
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 12,
+              ),
+            ),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0B0B0E),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              clip is Map && clip['url'] != null
+                  ? '$serverUrl${clip['url']}'
+                  : 'Clip generated',
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 11,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -261,268 +491,84 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        title: const Text(
+          'ClipAI',
+          style: TextStyle(
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(
-            20,
-            24,
-            20,
-            40,
+            18,
+            10,
+            18,
+            32,
           ),
           child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'AI Clipper',
+                'Turn long videos\ninto Shorts',
                 style: TextStyle(
-                  fontSize: 30,
-                  fontWeight: FontWeight.w800,
+                  fontSize: 32,
+                  height: 1.05,
+                  fontWeight: FontWeight.w900,
                 ),
               ),
-
-              const SizedBox(height: 6),
-
-              Text(
-                'Turn long videos into Shorts',
-                style: TextStyle(
-                  fontSize: 16,
-                  color: Colors.grey.shade400,
-                ),
-              ),
-
-              const SizedBox(height: 28),
-
-              /*
-               * URL
-               */
-
-              const Text(
-                'Video URL',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-
               const SizedBox(height: 10),
-
-              Container(
-                decoration: BoxDecoration(
-                  color:
-                      const Color(0xFF141419),
-                  borderRadius:
-                      BorderRadius.circular(16),
-                  border: Border.all(
-                    color:
-                        const Color(0xFF292930),
-                  ),
-                ),
-                child: TextField(
-                  controller: urlController,
-                  enabled: !isAnalyzing,
-                  keyboardType:
-                      TextInputType.url,
-                  textInputAction:
-                      TextInputAction.done,
-                  onChanged: (_) {
-                    if (selectedVideo != null) {
-                      setState(() {
-                        selectedVideo = null;
-                      });
-                    }
-                  },
-                  decoration:
-                      InputDecoration(
-                    hintText:
-                        'Paste YouTube URL',
-                    hintStyle: TextStyle(
-                      color:
-                          Colors.grey.shade600,
-                    ),
-                    prefixIcon:
-                        const Icon(
-                      Icons.link,
-                    ),
-                    suffixIcon:
-                        urlController.text
-                                .isNotEmpty
-                            ? IconButton(
-                                onPressed:
-                                    isAnalyzing
-                                        ? null
-                                        : () {
-                                            urlController
-                                                .clear();
-                                            setState(
-                                              () {},
-                                            );
-                                          },
-                                icon:
-                                    const Icon(
-                                  Icons.clear,
-                                ),
-                              )
-                            : null,
-                    border:
-                        InputBorder.none,
-                    contentPadding:
-                        const EdgeInsets
-                            .symmetric(
-                      horizontal: 16,
-                      vertical: 18,
-                    ),
-                  ),
+              const Text(
+                'AI finds the strongest moments automatically.',
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 15,
                 ),
               ),
+              const SizedBox(height: 24),
+
+              buildUrlCard(),
 
               const SizedBox(height: 12),
 
-              const Row(
+              Row(
                 children: [
-                  Expanded(
-                    child: Divider(),
+                  const Expanded(
+                    child: Divider(
+                      color: Colors.white12,
+                    ),
                   ),
-                  Padding(
-                    padding:
-                        EdgeInsets.symmetric(
+                  const Padding(
+                    padding: EdgeInsets.symmetric(
                       horizontal: 12,
                     ),
                     child: Text(
                       'OR',
                       style: TextStyle(
-                        color:
-                            Colors.grey,
-                        fontWeight:
-                            FontWeight.w700,
+                        color: Colors.white38,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ),
-                  Expanded(
-                    child: Divider(),
+                  const Expanded(
+                    child: Divider(
+                      color: Colors.white12,
+                    ),
                   ),
                 ],
               ),
 
               const SizedBox(height: 12),
 
-              /*
-               * UPLOAD
-               */
-
-              GestureDetector(
-                onTap:
-                    isAnalyzing
-                        ? null
-                        : pickVideo,
-                child: Container(
-                  width: double.infinity,
-                  padding:
-                      const EdgeInsets.all(
-                    22,
-                  ),
-                  decoration:
-                      BoxDecoration(
-                    color:
-                        const Color(
-                      0xFF141419,
-                    ),
-                    borderRadius:
-                        BorderRadius.circular(
-                      18,
-                    ),
-                    border: Border.all(
-                      color:
-                          const Color(
-                        0xFF2A2A32,
-                      ),
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      const Icon(
-                        Icons
-                            .cloud_upload_outlined,
-                        size: 42,
-                        color:
-                            Color(
-                          0xFFE91E63,
-                        ),
-                      ),
-
-                      const SizedBox(
-                        height: 12,
-                      ),
-
-                      Text(
-                        selectedVideo ==
-                                null
-                            ? 'Upload your video'
-                            : selectedVideo!
-                                .name,
-                        textAlign:
-                            TextAlign.center,
-                        style:
-                            const TextStyle(
-                          fontSize: 16,
-                          fontWeight:
-                              FontWeight.w700,
-                        ),
-                      ),
-
-                      const SizedBox(
-                        height: 6,
-                      ),
-
-                      Text(
-                        'MP4, MOV, WebM',
-                        style:
-                            TextStyle(
-                          color: Colors
-                              .grey
-                              .shade500,
-                        ),
-                      ),
-
-                      const SizedBox(
-                        height: 14,
-                      ),
-
-                      OutlinedButton(
-                        onPressed:
-                            isAnalyzing
-                                ? null
-                                : pickVideo,
-                        child: Text(
-                          selectedVideo ==
-                                  null
-                              ? 'Choose Video'
-                              : 'Change Video',
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+              buildUploadCard(),
 
               const SizedBox(height: 24),
 
-              /*
-               * NUMBER OF CLIPS
-               */
-
-              const Text(
-                'Number of clips',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight:
-                      FontWeight.w800,
-                ),
-              ),
-
-              const SizedBox(height: 10),
-
               buildDropdown(
+                label: 'Number of clips',
                 value: numberOfClips,
                 items: const [
                   '1 clip',
@@ -531,217 +577,134 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
                   '10 clips',
                   '15 clips',
                 ],
-                onChanged:
-                    isAnalyzing
-                        ? null
-                        : (value) {
-                            if (value !=
-                                null) {
-                              setState(() {
-                                numberOfClips =
-                                    value;
-                              });
-                            }
-                          },
+                onChanged: (value) {
+                  if (value != null) {
+                    setState(() {
+                      numberOfClips = value;
+                    });
+                  }
+                },
               ),
 
-              const SizedBox(height: 20),
-
-              /*
-               * FORMAT
-               */
-
-              const Text(
-                'Format',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight:
-                      FontWeight.w800,
-                ),
-              ),
-
-              const SizedBox(height: 10),
+              const SizedBox(height: 16),
 
               buildDropdown(
-                value: format,
+                label: 'Format',
+                value: videoFormat,
                 items: const [
                   '9:16 Shorts',
                   '1:1 Square',
                   '16:9 Landscape',
                 ],
-                onChanged:
-                    isAnalyzing
-                        ? null
-                        : (value) {
-                            if (value !=
-                                null) {
-                              setState(() {
-                                format =
-                                    value;
-                              });
-                            }
-                          },
+                onChanged: (value) {
+                  if (value != null) {
+                    setState(() {
+                      videoFormat = value;
+                    });
+                  }
+                },
               ),
 
-              const SizedBox(height: 20),
-
-              /*
-               * CAPTIONS
-               */
-
-              const Text(
-                'Captions',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight:
-                      FontWeight.w800,
-                ),
-              ),
-
-              const SizedBox(height: 10),
+              const SizedBox(height: 16),
 
               buildDropdown(
-                value: captions,
+                label: 'Captions',
+                value: captionsStyle,
                 items: const [
                   'Animated',
                   'Bold',
-                  'Clean',
                   'Minimal',
                   'None',
                 ],
-                onChanged:
-                    isAnalyzing
-                        ? null
-                        : (value) {
-                            if (value !=
-                                null) {
-                              setState(() {
-                                captions =
-                                    value;
-                              });
-                            }
-                          },
+                onChanged: (value) {
+                  if (value != null) {
+                    setState(() {
+                      captionsStyle = value;
+                    });
+                  }
+                },
               ),
 
-              const SizedBox(height: 26),
-
-              /*
-               * PROGRESS
-               */
-
-              if (isAnalyzing) ...[
-                Container(
-                  width:
-                      double.infinity,
-                  padding:
-                      const EdgeInsets.all(
-                    18,
-                  ),
-                  decoration:
-                      BoxDecoration(
-                    color:
-                        const Color(
-                      0xFF141419,
-                    ),
-                    borderRadius:
-                        BorderRadius.circular(
-                      16,
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      Row(
-                        children: [
-                          const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child:
-                                CircularProgressIndicator(
-                              strokeWidth:
-                                  2,
-                            ),
-                          ),
-                          const SizedBox(
-                            width: 12,
-                          ),
-                          Expanded(
-                            child: Text(
-                              statusText,
-                              style:
-                                  const TextStyle(
-                                fontWeight:
-                                    FontWeight
-                                        .w700,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-
-                      const SizedBox(
-                        height: 14,
-                      ),
-
-                      LinearProgressIndicator(
-                        value:
-                            progress,
-                        borderRadius:
-                            BorderRadius
-                                .circular(
-                          20,
-                        ),
-                      ),
-
-                      const SizedBox(
-                        height: 8,
-                      ),
-
-                      Text(
-                        '${(progress * 100).round()}%',
-                        style:
-                            TextStyle(
-                          fontSize: 12,
-                          color: Colors
-                              .grey
-                              .shade500,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 20,
-                ),
-              ],
-
-              /*
-               * FIND BUTTON
-               */
+              const SizedBox(height: 24),
 
               SizedBox(
                 width: double.infinity,
-                height: 58,
-                child:
-                    FilledButton.icon(
+                height: 56,
+                child: FilledButton.icon(
                   onPressed:
-                      isAnalyzing
-                          ? null
-                          : analyzeVideo,
-                  icon: const Icon(
-                    Icons
-                        .auto_awesome,
-                  ),
+                      isAnalyzing ? null : analyzeVideo,
+                  icon: isAnalyzing
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : const Icon(
+                          Icons.auto_awesome,
+                        ),
                   label: Text(
                     isAnalyzing
-                        ? 'Analyzing...'
+                        ? 'AI is finding the best clips...'
                         : 'Find Best Clips',
-                    style:
-                        const TextStyle(
-                      fontSize: 16,
-                      fontWeight:
-                          FontWeight.w800,
+                  ),
+                ),
+              ),
+
+              if (isAnalyzing) ...[
+                const SizedBox(height: 18),
+                const LinearProgressIndicator(),
+                const SizedBox(height: 8),
+                const Text(
+                  'Transcribing video and analyzing moments...',
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+
+              if (errorMessage != null) ...[
+                const SizedBox(height: 18),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF32171A),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Text(
+                    errorMessage!,
+                    style: const TextStyle(
+                      color: Colors.redAccent,
                     ),
                   ),
-                  style:
-                      Filled
+                ),
+              ],
+
+              if (clips.isNotEmpty) ...[
+                const SizedBox(height: 30),
+                const Text(
+                  'Best Clips',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...List.generate(
+                  clips.length,
+                  (index) => buildClipCard(
+                    clips[index],
+                    index,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

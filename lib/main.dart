@@ -40,9 +40,11 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  static const String serverUrl = 'https://clipai-app.onrender.com';
+  static const String serverUrl =
+      'https://clipai-app.onrender.com';
 
-  final TextEditingController urlController = TextEditingController();
+  final TextEditingController urlController =
+      TextEditingController();
 
   File? selectedVideo;
 
@@ -65,15 +67,22 @@ class _HomePageState extends State<HomePage> {
     try {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: ['mp4', 'mov', 'webm', 'mkv'],
+        allowedExtensions: [
+          'mp4',
+          'mov',
+          'webm',
+          'mkv',
+        ],
       );
 
-      if (result == null || result.files.single.path == null) {
+      if (result == null ||
+          result.files.single.path == null) {
         return;
       }
 
       setState(() {
-        selectedVideo = File(result.files.single.path!);
+        selectedVideo =
+            File(result.files.single.path!);
         urlController.clear();
       });
     } catch (e) {
@@ -98,83 +107,130 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<bool> testServerConnection() async {
-    if (mounted) {
-      setState(() {
-        testingConnection = true;
-      });
+  Future<void> testConnection() async {
+    if (testingConnection || loading) return;
+
+    setState(() {
+      testingConnection = true;
+    });
+
+    final results = <String>[];
+
+    // TEST 1 — Internet
+    try {
+      final response = await http
+          .get(
+            Uri.parse('https://example.com'),
+          )
+          .timeout(
+            const Duration(seconds: 10),
+          );
+
+      results.add(
+        '🌐 Internet: OK\n'
+        'HTTP ${response.statusCode}',
+      );
+    } on SocketException catch (e) {
+      results.add(
+        '❌ Internet: FAILED\n'
+        '$e',
+      );
+    } on TimeoutException {
+      results.add(
+        '❌ Internet: TIMEOUT',
+      );
+    } catch (e) {
+      results.add(
+        '❌ Internet: FAILED\n'
+        '$e',
+      );
     }
 
+    // TEST 2 — DNS
     try {
-      final uri = Uri.parse('$serverUrl/');
+      final addresses =
+          await InternetAddress.lookup(
+        'clipai-app.onrender.com',
+      ).timeout(
+        const Duration(seconds: 10),
+      );
 
-      final response = await http
-          .get(uri)
-          .timeout(const Duration(seconds: 15));
-
-      if (!mounted) return false;
-
-      setState(() {
-        testingConnection = false;
-      });
-
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        return true;
+      if (addresses.isNotEmpty) {
+        results.add(
+          '🔎 DNS: OK\n'
+          '${addresses.map((e) => e.address).join(', ')}',
+        );
+      } else {
+        results.add(
+          '❌ DNS: NO ADDRESS FOUND',
+        );
       }
+    } on SocketException catch (e) {
+      results.add(
+        '❌ DNS: FAILED\n'
+        '$e',
+      );
+    } on TimeoutException {
+      results.add(
+        '❌ DNS: TIMEOUT',
+      );
+    } catch (e) {
+      results.add(
+        '❌ DNS: FAILED\n'
+        '$e',
+      );
+    }
 
-      showError(
-        'Server responded with HTTP ${response.statusCode}.\n\n'
+    // TEST 3 — Render
+    try {
+      final response = await http
+          .get(
+            Uri.parse('$serverUrl/'),
+          )
+          .timeout(
+            const Duration(seconds: 15),
+          );
+
+      results.add(
+        '🟢 Render: OK\n'
+        'HTTP ${response.statusCode}\n\n'
         '${response.body}',
       );
-
-      return false;
     } on SocketException catch (e) {
-      if (!mounted) return false;
-
-      setState(() {
-        testingConnection = false;
-      });
-
-      showError(
-        'DNS / Internet connection error.\n\n'
-        'Could not connect to:\n'
-        '$serverUrl\n\n'
-        'Error:\n$e',
+      results.add(
+        '❌ Render: FAILED\n'
+        '$e',
       );
-
-      return false;
     } on TimeoutException {
-      if (!mounted) return false;
-
-      setState(() {
-        testingConnection = false;
-      });
-
-      showError(
-        'Connection timed out.\n\n'
-        'The server did not respond within 15 seconds.',
+      results.add(
+        '❌ Render: TIMEOUT',
       );
-
-      return false;
     } catch (e) {
-      if (!mounted) return false;
-
-      setState(() {
-        testingConnection = false;
-      });
-
-      showError('Connection failed:\n\n$e');
-
-      return false;
+      results.add(
+        '❌ Render: FAILED\n'
+        '$e',
+      );
     }
+
+    if (!mounted) return;
+
+    setState(() {
+      testingConnection = false;
+    });
+
+    showError(
+      results.join('\n\n--------------------\n\n'),
+    );
   }
 
   Future<void> analyzeVideo() async {
     if (loading || testingConnection) return;
 
-    final youtubeUrl = urlController.text.trim();
+    final youtubeUrl =
+        urlController.text.trim();
 
-    if (selectedVideo == null && youtubeUrl.isEmpty) {
+    if (selectedVideo == null &&
+        youtubeUrl.isEmpty) {
       showError(
         'Upload a video or paste a YouTube URL first.',
       );
@@ -187,20 +243,11 @@ class _HomePageState extends State<HomePage> {
     });
 
     try {
-      final serverOnline = await testServerConnection();
+      final uri =
+          Uri.parse('$serverUrl/api/analyze');
 
-      if (!serverOnline) {
-        if (mounted) {
-          setState(() {
-            loading = false;
-          });
-        }
-        return;
-      }
-
-      final uri = Uri.parse('$serverUrl/api/analyze');
-
-      final request = http.MultipartRequest(
+      final request =
+          http.MultipartRequest(
         'POST',
         uri,
       );
@@ -224,18 +271,22 @@ class _HomePageState extends State<HomePage> {
         );
       }
 
-      final streamedResponse = await request.send().timeout(
+      final streamedResponse =
+          await request.send().timeout(
         const Duration(minutes: 10),
       );
 
       final response =
-          await http.Response.fromStream(streamedResponse);
+          await http.Response.fromStream(
+        streamedResponse,
+      );
 
       if (!mounted) return;
 
       if (response.statusCode >= 200 &&
           response.statusCode < 300) {
-        final data = jsonDecode(response.body);
+        final data =
+            jsonDecode(response.body);
 
         setState(() {
           loading = false;
@@ -255,9 +306,12 @@ class _HomePageState extends State<HomePage> {
         String message = response.body;
 
         try {
-          final data = jsonDecode(response.body);
+          final data =
+              jsonDecode(response.body);
+
           message =
-              data['error']?.toString() ?? response.body;
+              data['error']?.toString() ??
+                  response.body;
         } catch (_) {}
 
         showError(
@@ -308,7 +362,7 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text('ClipAI Error'),
+          title: const Text('ClipAI Diagnostics'),
           content: SingleChildScrollView(
             child: SelectableText(message),
           ),
@@ -331,21 +385,25 @@ class _HomePageState extends State<HomePage> {
     required ValueChanged<String?> onChanged,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(
+      padding:
+          const EdgeInsets.symmetric(
         horizontal: 14,
       ),
       decoration: BoxDecoration(
         color: const Color(0xFF18181B),
-        borderRadius: BorderRadius.circular(14),
+        borderRadius:
+            BorderRadius.circular(14),
         border: Border.all(
-          color: Colors.white.withOpacity(0.08),
+          color:
+              Colors.white.withOpacity(0.08),
         ),
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
           value: value,
           isExpanded: true,
-          dropdownColor: const Color(0xFF18181B),
+          dropdownColor:
+              const Color(0xFF18181B),
           items: items.map((item) {
             return DropdownMenuItem<String>(
               value: item,
@@ -360,7 +418,8 @@ class _HomePageState extends State<HomePage> {
 
   Widget buildSectionTitle(String title) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
+      padding:
+          const EdgeInsets.only(bottom: 10),
       child: Text(
         title,
         style: const TextStyle(
@@ -377,9 +436,11 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: const Color(0xFF121214),
-        borderRadius: BorderRadius.circular(22),
+        borderRadius:
+            BorderRadius.circular(22),
         border: Border.all(
-          color: Colors.white.withOpacity(0.08),
+          color:
+              Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
@@ -400,17 +461,24 @@ class _HomePageState extends State<HomePage> {
           Text(
             selectedVideo == null
                 ? 'MP4, MOV, WebM or MKV'
-                : selectedVideo!.path.split('/').last,
+                : selectedVideo!.path
+                    .split('/')
+                    .last,
             textAlign: TextAlign.center,
             style: TextStyle(
-              color: Colors.white.withOpacity(0.55),
+              color:
+                  Colors.white.withOpacity(0.55),
             ),
           ),
           const SizedBox(height: 16),
           OutlinedButton.icon(
-            onPressed: loading ? null : pickVideo,
-            icon: const Icon(Icons.upload_file),
-            label: const Text('Choose video'),
+            onPressed:
+                loading ? null : pickVideo,
+            icon: const Icon(
+              Icons.upload_file,
+            ),
+            label:
+                const Text('Choose video'),
           ),
         ],
       ),
@@ -423,9 +491,11 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         color: const Color(0xFF121214),
-        borderRadius: BorderRadius.circular(22),
+        borderRadius:
+            BorderRadius.circular(22),
         border: Border.all(
-          color: Colors.white.withOpacity(0.08),
+          color:
+              Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
@@ -452,15 +522,19 @@ class _HomePageState extends State<HomePage> {
               }
             },
             decoration: InputDecoration(
-              hintText: 'Paste YouTube URL',
+              hintText:
+                  'Paste YouTube URL',
               prefixIcon:
                   const Icon(Icons.link),
               filled: true,
-              fillColor: const Color(0xFF1B1B1F),
-              border: OutlineInputBorder(
+              fillColor:
+                  const Color(0xFF1B1B1F),
+              border:
+                  OutlineInputBorder(
                 borderRadius:
                     BorderRadius.circular(14),
-                borderSide: BorderSide.none,
+                borderSide:
+                    BorderSide.none,
               ),
             ),
           ),
@@ -485,16 +559,16 @@ class _HomePageState extends State<HomePage> {
 
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(
-        bottom: 12,
-      ),
+      margin:
+          const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: const Color(0xFF121214),
         borderRadius:
             BorderRadius.circular(18),
         border: Border.all(
-          color: Colors.white.withOpacity(0.08),
+          color:
+              Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
@@ -539,10 +613,23 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         centerTitle: false,
+        actions: [
+          IconButton(
+            tooltip: 'Test connection',
+            onPressed:
+                testingConnection || loading
+                    ? null
+                    : testConnection,
+            icon: const Icon(
+              Icons.network_check,
+            ),
+          ),
+        ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(
+          padding:
+              const EdgeInsets.fromLTRB(
             16,
             8,
             16,
@@ -560,9 +647,7 @@ class _HomePageState extends State<HomePage> {
                   height: 1.1,
                 ),
               ),
-
               const SizedBox(height: 8),
-
               Text(
                 'AI finds the best moments automatically.',
                 style: TextStyle(
@@ -571,8 +656,28 @@ class _HomePageState extends State<HomePage> {
                   fontSize: 15,
                 ),
               ),
+              const SizedBox(height: 12),
 
-              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed:
+                      testingConnection ||
+                              loading
+                          ? null
+                          : testConnection,
+                  icon: const Icon(
+                    Icons.network_check,
+                  ),
+                  label: Text(
+                    testingConnection
+                        ? 'Testing connection...'
+                        : 'Test Connection',
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 18),
 
               buildUrlCard(),
 
@@ -692,41 +797,19 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         )
-                      : testingConnection
-                          ? const Row(
-                              mainAxisAlignment:
-                                  MainAxisAlignment
-                                      .center,
-                              children: [
-                                SizedBox(
-                                  width: 21,
-                                  height: 21,
-                                  child:
-                                      CircularProgressIndicator(
-                                    strokeWidth:
-                                        2.5,
-                                  ),
-                                ),
-                                SizedBox(width: 12),
-                                Text(
-                                  'Connecting...',
-                                ),
-                              ],
-                            )
-                          : const Text(
-                              'Find Best Clips',
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight:
-                                    FontWeight.bold,
-                              ),
-                            ),
+                      : const Text(
+                          'Find Best Clips',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight:
+                                FontWeight.bold,
+                          ),
+                        ),
                 ),
               ),
 
               if (clips.isNotEmpty) ...[
                 const SizedBox(height: 30),
-
                 const Text(
                   'Best Clips',
                   style: TextStyle(
@@ -735,9 +818,7 @@ class _HomePageState extends State<HomePage> {
                         FontWeight.w800,
                   ),
                 ),
-
                 const SizedBox(height: 12),
-
                 ...List.generate(
                   clips.length,
                   (index) {
@@ -747,11 +828,4 @@ class _HomePageState extends State<HomePage> {
                     );
                   },
                 ),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
+              ]

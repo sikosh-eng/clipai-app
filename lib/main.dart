@@ -21,9 +21,9 @@ class ClipAIApp extends StatelessWidget {
       title: 'ClipAI',
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF09090B),
+        scaffoldBackgroundColor: const Color(0xFF08080B),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF7C3AED),
+          seedColor: const Color(0xFFE91E63),
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
@@ -41,39 +41,75 @@ class ClipMakerPage extends StatefulWidget {
 }
 
 class _ClipMakerPageState extends State<ClipMakerPage> {
+  final TextEditingController urlController =
+      TextEditingController();
+
   PlatformFile? selectedVideo;
 
   String numberOfClips = '5 clips';
   String format = '9:16 Shorts';
-  String captions = 'Animated';
+  String captions = 'Bold';
 
   bool isAnalyzing = false;
   double progress = 0;
 
+  String statusText = '';
+
   List<dynamic> clips = [];
 
+  @override
+  void dispose() {
+    urlController.dispose();
+    super.dispose();
+  }
+
   Future<void> pickVideo() async {
-    final file = await FilePicker.pickFile(
+    final result = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['mp4', 'mov', 'webm', 'mkv'],
+      allowedExtensions: [
+        'mp4',
+        'mov',
+        'webm',
+        'mkv',
+      ],
     );
 
-    if (file == null) return;
+    if (result == null || result.files.isEmpty) {
+      return;
+    }
 
     setState(() {
-      selectedVideo = file;
+      selectedVideo = result.files.first;
+      urlController.clear();
       clips = [];
     });
   }
 
+  void clearVideo() {
+    setState(() {
+      selectedVideo = null;
+    });
+  }
+
   Future<void> analyzeVideo() async {
-    if (selectedVideo == null) {
-      _showMessage('First select a video.');
+    final url = urlController.text.trim();
+
+    final hasUrl = url.isNotEmpty;
+    final hasFile =
+        selectedVideo != null &&
+        selectedVideo!.path != null;
+
+    if (!hasUrl && !hasFile) {
+      showMessage(
+        'Paste a video URL or choose a video file.',
+      );
       return;
     }
 
-    if (selectedVideo!.path == null) {
-      _showMessage('Could not access the selected video.');
+    if (hasUrl && !isValidYouTubeUrl(url)) {
+      showMessage(
+        'Please enter a valid YouTube URL.',
+      );
       return;
     }
 
@@ -81,6 +117,7 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
       isAnalyzing = true;
       progress = 0.05;
       clips = [];
+      statusText = 'Preparing video...';
     });
 
     try {
@@ -89,13 +126,25 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
         Uri.parse('$serverUrl/api/analyze'),
       );
 
-      request.files.add(
-        await http.MultipartFile.fromPath(
-          'video',
-          selectedVideo!.path!,
-          filename: selectedVideo!.name,
-        ),
-      );
+      /*
+       * URL MODE
+       */
+      if (hasUrl) {
+        request.fields['url'] = url;
+      }
+
+      /*
+       * FILE MODE
+       */
+      if (hasFile) {
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'video',
+            selectedVideo!.path!,
+            filename: selectedVideo!.name,
+          ),
+        );
+      }
 
       request.fields['numberOfClips'] =
           numberOfClips.split(' ').first;
@@ -104,70 +153,107 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
       request.fields['captions'] = captions;
 
       setState(() {
-        progress = 0.15;
+        progress = 0.12;
+        statusText = hasUrl
+            ? 'Getting your video...'
+            : 'Uploading your video...';
       });
 
-      final streamedResponse = await request.send();
+      final streamedResponse =
+          await request.send();
 
       setState(() {
-        progress = 0.75;
+        progress = 0.70;
+        statusText =
+            'AI is finding the best moments...';
       });
 
-      final response = await http.Response.fromStream(
+      final response =
+          await http.Response.fromStream(
         streamedResponse,
       );
 
       setState(() {
-        progress = 1.0;
+        progress = 0.90;
+        statusText = 'Creating your clips...';
       });
 
       if (response.statusCode >= 200 &&
           response.statusCode < 300) {
         final data = jsonDecode(response.body);
 
+        final receivedClips =
+            data['clips'] ?? [];
+
         setState(() {
-          clips = data['clips'] ?? [];
+          clips = receivedClips;
+          progress = 1.0;
           isAnalyzing = false;
+          statusText = 'Finished!';
         });
 
-        _showMessage(
+        showMessage(
           'Done! Found ${clips.length} clips.',
         );
       } else {
-        String errorMessage = 'Server error';
+        String errorMessage =
+            'Server error: ${response.statusCode}';
 
         try {
-          final data = jsonDecode(response.body);
+          final data =
+              jsonDecode(response.body);
 
           if (data['error'] != null) {
-            errorMessage = data['error'].toString();
+            errorMessage =
+                data['error'].toString();
           }
         } catch (_) {}
 
         setState(() {
           isAnalyzing = false;
+          statusText = '';
         });
 
-        _showMessage(errorMessage);
+        showMessage(errorMessage);
       }
-    } catch (e) {
+    } catch (error) {
       setState(() {
         isAnalyzing = false;
+        statusText = '';
       });
 
-      _showMessage(
-        'Connection error. Check your internet connection.',
+      showMessage(
+        'Connection error. Please try again.',
       );
     }
   }
 
-  void _showMessage(String message) {
+  bool isValidYouTubeUrl(String value) {
+    try {
+      final uri = Uri.parse(value);
+
+      final host =
+          uri.host.toLowerCase();
+
+      return host == 'youtube.com' ||
+          host == 'www.youtube.com' ||
+          host == 'm.youtube.com' ||
+          host == 'youtu.be' ||
+          host == 'www.youtu.be';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void showMessage(String message) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context).showSnackBar(
+    ScaffoldMessenger.of(context)
+        .showSnackBar(
       SnackBar(
         content: Text(message),
-        behavior: SnackBarBehavior.floating,
+        behavior:
+            SnackBarBehavior.floating,
       ),
     );
   }
@@ -184,10 +270,11 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
             40,
           ),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment:
+                CrossAxisAlignment.start,
             children: [
               const Text(
-                'ClipAI',
+                'AI Clipper',
                 style: TextStyle(
                   fontSize: 30,
                   fontWeight: FontWeight.w800,
@@ -206,59 +293,209 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
 
               const SizedBox(height: 28),
 
-              _sectionTitle('Upload video'),
+              /*
+               * URL
+               */
+
+              const Text(
+                'Video URL',
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
 
               const SizedBox(height: 10),
 
+              Container(
+                decoration: BoxDecoration(
+                  color:
+                      const Color(0xFF141419),
+                  borderRadius:
+                      BorderRadius.circular(16),
+                  border: Border.all(
+                    color:
+                        const Color(0xFF292930),
+                  ),
+                ),
+                child: TextField(
+                  controller: urlController,
+                  enabled: !isAnalyzing,
+                  keyboardType:
+                      TextInputType.url,
+                  textInputAction:
+                      TextInputAction.done,
+                  onChanged: (_) {
+                    if (selectedVideo != null) {
+                      setState(() {
+                        selectedVideo = null;
+                      });
+                    }
+                  },
+                  decoration:
+                      InputDecoration(
+                    hintText:
+                        'Paste YouTube URL',
+                    hintStyle: TextStyle(
+                      color:
+                          Colors.grey.shade600,
+                    ),
+                    prefixIcon:
+                        const Icon(
+                      Icons.link,
+                    ),
+                    suffixIcon:
+                        urlController.text
+                                .isNotEmpty
+                            ? IconButton(
+                                onPressed:
+                                    isAnalyzing
+                                        ? null
+                                        : () {
+                                            urlController
+                                                .clear();
+                                            setState(
+                                              () {},
+                                            );
+                                          },
+                                icon:
+                                    const Icon(
+                                  Icons.clear,
+                                ),
+                              )
+                            : null,
+                    border:
+                        InputBorder.none,
+                    contentPadding:
+                        const EdgeInsets
+                            .symmetric(
+                      horizontal: 16,
+                      vertical: 18,
+                    ),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              const Row(
+                children: [
+                  Expanded(
+                    child: Divider(),
+                  ),
+                  Padding(
+                    padding:
+                        EdgeInsets.symmetric(
+                      horizontal: 12,
+                    ),
+                    child: Text(
+                      'OR',
+                      style: TextStyle(
+                        color:
+                            Colors.grey,
+                        fontWeight:
+                            FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: Divider(),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 12),
+
+              /*
+               * UPLOAD
+               */
+
               GestureDetector(
-                onTap: isAnalyzing ? null : pickVideo,
+                onTap:
+                    isAnalyzing
+                        ? null
+                        : pickVideo,
                 child: Container(
                   width: double.infinity,
-                  padding: const EdgeInsets.all(22),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF141419),
-                    borderRadius: BorderRadius.circular(18),
+                  padding:
+                      const EdgeInsets.all(
+                    22,
+                  ),
+                  decoration:
+                      BoxDecoration(
+                    color:
+                        const Color(
+                      0xFF141419,
+                    ),
+                    borderRadius:
+                        BorderRadius.circular(
+                      18,
+                    ),
                     border: Border.all(
-                      color: const Color(0xFF2A2A32),
+                      color:
+                          const Color(
+                        0xFF2A2A32,
+                      ),
                     ),
                   ),
                   child: Column(
                     children: [
                       const Icon(
-                        Icons.cloud_upload_outlined,
+                        Icons
+                            .cloud_upload_outlined,
                         size: 42,
-                        color: Color(0xFFA78BFA),
-                      ),
-
-                      const SizedBox(height: 12),
-
-                      Text(
-                        selectedVideo == null
-                            ? 'Upload your video'
-                            : selectedVideo!.name,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
+                        color:
+                            Color(
+                          0xFFE91E63,
                         ),
                       ),
 
-                      const SizedBox(height: 6),
+                      const SizedBox(
+                        height: 12,
+                      ),
+
+                      Text(
+                        selectedVideo ==
+                                null
+                            ? 'Upload your video'
+                            : selectedVideo!
+                                .name,
+                        textAlign:
+                            TextAlign.center,
+                        style:
+                            const TextStyle(
+                          fontSize: 16,
+                          fontWeight:
+                              FontWeight.w700,
+                        ),
+                      ),
+
+                      const SizedBox(
+                        height: 6,
+                      ),
 
                       Text(
                         'MP4, MOV, WebM',
-                        style: TextStyle(
-                          color: Colors.grey.shade500,
+                        style:
+                            TextStyle(
+                          color: Colors
+                              .grey
+                              .shade500,
                         ),
                       ),
 
-                      const SizedBox(height: 14),
+                      const SizedBox(
+                        height: 14,
+                      ),
 
                       OutlinedButton(
                         onPressed:
-                            isAnalyzing ? null : pickVideo,
+                            isAnalyzing
+                                ? null
+                                : pickVideo,
                         child: Text(
-                          selectedVideo == null
+                          selectedVideo ==
+                                  null
                               ? 'Choose Video'
                               : 'Change Video',
                         ),
@@ -270,11 +507,22 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
 
               const SizedBox(height: 24),
 
-              _sectionTitle('Number of clips'),
+              /*
+               * NUMBER OF CLIPS
+               */
+
+              const Text(
+                'Number of clips',
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
 
               const SizedBox(height: 10),
 
-              _dropdown(
+              buildDropdown(
                 value: numberOfClips,
                 items: const [
                   '1 clip',
@@ -283,307 +531,217 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
                   '10 clips',
                   '15 clips',
                 ],
-                onChanged: isAnalyzing
-                    ? null
-                    : (value) {
-                        if (value != null) {
-                          setState(() {
-                            numberOfClips = value;
-                          });
-                        }
-                      },
+                onChanged:
+                    isAnalyzing
+                        ? null
+                        : (value) {
+                            if (value !=
+                                null) {
+                              setState(() {
+                                numberOfClips =
+                                    value;
+                              });
+                            }
+                          },
               ),
 
               const SizedBox(height: 20),
 
-              _sectionTitle('Format'),
+              /*
+               * FORMAT
+               */
+
+              const Text(
+                'Format',
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
 
               const SizedBox(height: 10),
 
-              _dropdown(
+              buildDropdown(
                 value: format,
                 items: const [
                   '9:16 Shorts',
                   '1:1 Square',
                   '16:9 Landscape',
                 ],
-                onChanged: isAnalyzing
-                    ? null
-                    : (value) {
-                        if (value != null) {
-                          setState(() {
-                            format = value;
-                          });
-                        }
-                      },
+                onChanged:
+                    isAnalyzing
+                        ? null
+                        : (value) {
+                            if (value !=
+                                null) {
+                              setState(() {
+                                format =
+                                    value;
+                              });
+                            }
+                          },
               ),
 
               const SizedBox(height: 20),
 
-              _sectionTitle('Captions'),
+              /*
+               * CAPTIONS
+               */
+
+              const Text(
+                'Captions',
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight:
+                      FontWeight.w800,
+                ),
+              ),
 
               const SizedBox(height: 10),
 
-              _dropdown(
+              buildDropdown(
                 value: captions,
                 items: const [
                   'Animated',
-                  'Clean',
                   'Bold',
+                  'Clean',
                   'Minimal',
                   'None',
                 ],
-                onChanged: isAnalyzing
-                    ? null
-                    : (value) {
-                        if (value != null) {
-                          setState(() {
-                            captions = value;
-                          });
-                        }
-                      },
+                onChanged:
+                    isAnalyzing
+                        ? null
+                        : (value) {
+                            if (value !=
+                                null) {
+                              setState(() {
+                                captions =
+                                    value;
+                              });
+                            }
+                          },
               ),
 
-              const SizedBox(height: 28),
+              const SizedBox(height: 26),
+
+              /*
+               * PROGRESS
+               */
 
               if (isAnalyzing) ...[
                 Container(
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF141419),
-                    borderRadius: BorderRadius.circular(16),
+                  width:
+                      double.infinity,
+                  padding:
+                      const EdgeInsets.all(
+                    18,
+                  ),
+                  decoration:
+                      BoxDecoration(
+                    color:
+                        const Color(
+                      0xFF141419,
+                    ),
+                    borderRadius:
+                        BorderRadius.circular(
+                      16,
+                    ),
                   ),
                   child: Column(
                     children: [
-                      const Row(
+                      Row(
                         children: [
-                          SizedBox(
+                          const SizedBox(
                             width: 20,
                             height: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
+                            child:
+                                CircularProgressIndicator(
+                              strokeWidth:
+                                  2,
                             ),
                           ),
-                          SizedBox(width: 12),
+                          const SizedBox(
+                            width: 12,
+                          ),
                           Expanded(
                             child: Text(
-                              'AI is finding the best moments...',
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
+                              statusText,
+                              style:
+                                  const TextStyle(
+                                fontWeight:
+                                    FontWeight
+                                        .w700,
                               ),
                             ),
                           ),
                         ],
                       ),
 
-                      const SizedBox(height: 14),
-
-                      LinearProgressIndicator(
-                        value: progress,
-                        borderRadius:
-                            BorderRadius.circular(20),
+                      const SizedBox(
+                        height: 14,
                       ),
 
-                      const SizedBox(height: 8),
+                      LinearProgressIndicator(
+                        value:
+                            progress,
+                        borderRadius:
+                            BorderRadius
+                                .circular(
+                          20,
+                        ),
+                      ),
+
+                      const SizedBox(
+                        height: 8,
+                      ),
 
                       Text(
-                        'This can take a few minutes for long videos.',
-                        style: TextStyle(
+                        '${(progress * 100).round()}%',
+                        style:
+                            TextStyle(
                           fontSize: 12,
-                          color: Colors.grey.shade500,
+                          color: Colors
+                              .grey
+                              .shade500,
                         ),
                       ),
                     ],
                   ),
                 ),
 
-                const SizedBox(height: 20),
+                const SizedBox(
+                  height: 20,
+                ),
               ],
+
+              /*
+               * FIND BUTTON
+               */
 
               SizedBox(
                 width: double.infinity,
-                height: 56,
-                child: FilledButton(
+                height: 58,
+                child:
+                    FilledButton.icon(
                   onPressed:
-                      isAnalyzing ? null : analyzeVideo,
-                  style: FilledButton.styleFrom(
-                    backgroundColor:
-                        const Color(0xFF7C3AED),
-                    shape: RoundedRectangleBorder(
-                      borderRadius:
-                          BorderRadius.circular(16),
-                    ),
+                      isAnalyzing
+                          ? null
+                          : analyzeVideo,
+                  icon: const Icon(
+                    Icons
+                        .auto_awesome,
                   ),
-                  child: Text(
+                  label: Text(
                     isAnalyzing
                         ? 'Analyzing...'
                         : 'Find Best Clips',
-                    style: const TextStyle(
+                    style:
+                        const TextStyle(
                       fontSize: 16,
-                      fontWeight: FontWeight.w800,
+                      fontWeight:
+                          FontWeight.w800,
                     ),
                   ),
-                ),
-              ),
-
-              if (clips.isNotEmpty) ...[
-                const SizedBox(height: 32),
-
-                _sectionTitle(
-                  'Best clips (${clips.length})',
-                ),
-
-                const SizedBox(height: 12),
-
-                ...clips.map(
-                  (clip) => _clipCard(clip),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _sectionTitle(String text) {
-    return Text(
-      text,
-      style: const TextStyle(
-        fontSize: 17,
-        fontWeight: FontWeight.w800,
-      ),
-    );
-  }
-
-  Widget _dropdown({
-    required String value,
-    required List<String> items,
-    required ValueChanged<String?>? onChanged,
-  }) {
-    return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: 16,
-      ),
-      decoration: BoxDecoration(
-        color: const Color(0xFF141419),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: const Color(0xFF292930),
-        ),
-      ),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: value,
-          isExpanded: true,
-          dropdownColor: const Color(0xFF18181D),
-          items: items
-              .map(
-                (item) => DropdownMenuItem<String>(
-                  value: item,
-                  child: Text(item),
-                ),
-              )
-              .toList(),
-          onChanged: onChanged,
-        ),
-      ),
-    );
-  }
-
-  Widget _clipCard(dynamic clip) {
-    final title =
-        clip['title']?.toString() ?? 'Best moment';
-
-    final reason =
-        clip['reason']?.toString() ?? '';
-
-    final score =
-        clip['score']?.toString() ?? '';
-
-    final start =
-        double.tryParse(
-              clip['start']?.toString() ?? '',
-            ) ??
-            0;
-
-    final end =
-        double.tryParse(
-              clip['end']?.toString() ?? '',
-            ) ??
-            0;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF141419),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF292930),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment:
-            CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(
-                Icons.auto_awesome,
-                color: Color(0xFFA78BFA),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-              if (score.isNotEmpty)
-                Text(
-                  '$score/100',
-                  style: const TextStyle(
-                    color: Color(0xFFA78BFA),
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-            ],
-          ),
-
-          const SizedBox(height: 10),
-
-          Text(
-            reason,
-            style: TextStyle(
-              color: Colors.grey.shade400,
-              height: 1.4,
-            ),
-          ),
-
-          const SizedBox(height: 10),
-
-          Text(
-            '${_formatTime(start)} → ${_formatTime(end)}',
-            style: TextStyle(
-              color: Colors.grey.shade500,
-              fontSize: 13,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _formatTime(double seconds) {
-    final totalSeconds = seconds.round();
-
-    final minutes = totalSeconds ~/ 60;
-    final secs = totalSeconds % 60;
-
-    return '$minutes:${secs.toString().padLeft(2, '0')}';
-  }
-}
+                  style:
+                      Filled

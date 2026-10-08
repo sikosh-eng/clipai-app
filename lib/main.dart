@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -14,44 +15,44 @@ class ClipAIApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ClipAI',
       debugShowCheckedModeBanner: false,
+      title: 'ClipAI',
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF08080A),
+        scaffoldBackgroundColor: const Color(0xFF09090B),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF7C5CFF),
+          seedColor: Colors.deepPurple,
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
       ),
-      home: const ClipMakerPage(),
+      home: const HomePage(),
     );
   }
 }
 
-class ClipMakerPage extends StatefulWidget {
-  const ClipMakerPage({super.key});
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
 
   @override
-  State<ClipMakerPage> createState() => _ClipMakerPageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _ClipMakerPageState extends State<ClipMakerPage> {
+class _HomePageState extends State<HomePage> {
   static const String serverUrl = 'https://clipai-app.onrender.com';
 
   final TextEditingController urlController = TextEditingController();
 
-  PlatformFile? selectedVideo;
+  File? selectedVideo;
 
   String numberOfClips = '5 clips';
-  String videoFormat = '9:16 Shorts';
-  String captionsStyle = 'Animated';
+  String format = '9:16 Shorts';
+  String captions = 'Animated';
 
-  bool isAnalyzing = false;
+  bool loading = false;
+  bool testingConnection = false;
 
   List<dynamic> clips = [];
-  String? errorMessage;
 
   @override
   void dispose() {
@@ -62,301 +63,374 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
   Future<void> pickVideo() async {
     try {
       final result = await FilePicker.platform.pickFiles(
-        type: FileType.video,
-        allowMultiple: false,
+        type: FileType.custom,
+        allowedExtensions: ['mp4', 'mov', 'webm', 'mkv'],
       );
 
-      if (result == null || result.files.isEmpty) {
+      if (result == null || result.files.single.path == null) {
         return;
       }
 
       setState(() {
-        selectedVideo = result.files.first;
+        selectedVideo = File(result.files.single.path!);
         urlController.clear();
-        errorMessage = null;
-        clips = [];
       });
     } catch (e) {
-      setState(() {
-        errorMessage = 'Could not select video: $e';
-      });
+      showError('Could not select video:\n$e');
     }
   }
 
-  Future<void> analyzeVideo() async {
-    final url = urlController.text.trim();
-
-    if (selectedVideo == null && url.isEmpty) {
-      showMessage('Upload a video or paste a YouTube URL.');
-      return;
+  int getClipCount() {
+    switch (numberOfClips) {
+      case '1 clip':
+        return 1;
+      case '3 clips':
+        return 3;
+      case '5 clips':
+        return 5;
+      case '10 clips':
+        return 10;
+      case '15 clips':
+        return 15;
+      default:
+        return 5;
     }
+  }
 
-    if (url.isNotEmpty && !isYouTubeUrl(url)) {
-      showMessage('Please enter a valid YouTube URL.');
-      return;
-    }
+  Future<bool> testServerConnection() async {
+    if (!mounted) return false;
 
     setState(() {
-      isAnalyzing = true;
-      errorMessage = null;
-      clips = [];
+      testingConnection = true;
     });
 
     try {
-      final request = http.MultipartRequest(
-        'POST',
-        Uri.parse('$serverUrl/api/analyze'),
-      );
+      final uri = Uri.parse('$serverUrl/');
 
-      request.fields['numberOfClips'] =
-          numberOfClips.split(' ').first;
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(seconds: 15));
 
-      request.fields['format'] = videoFormat;
-      request.fields['captions'] = captionsStyle;
+      if (!mounted) return false;
 
-      if (url.isNotEmpty) {
-        request.fields['url'] = url;
-      }
-
-      if (selectedVideo != null && selectedVideo!.path != null) {
-        request.files.add(
-          await http.MultipartFile.fromPath(
-            'video',
-            selectedVideo!.path!,
-            filename: selectedVideo!.name,
-          ),
-        );
-      }
-
-      final streamedResponse = await request.send();
-      final response = await http.Response.fromStream(
-        streamedResponse,
-      );
-
-      if (response.statusCode < 200 ||
-          response.statusCode >= 300) {
-        String message =
-            'Server error: ${response.statusCode}';
-
-        try {
-          final data = jsonDecode(response.body);
-
-          if (data is Map && data['error'] != null) {
-            message = data['error'].toString();
-          }
-        } catch (_) {}
-
-        throw Exception(message);
-      }
-
-      final data = jsonDecode(response.body);
-
-      if (data is! Map) {
-        throw Exception('Invalid server response.');
-      }
-
-      final returnedClips = data['clips'];
-
-      if (returnedClips is List) {
-        setState(() {
-          clips = returnedClips;
-        });
-      }
-
-      if (clips.isEmpty) {
-        throw Exception(
-          'AI could not find suitable clips.',
-        );
-      }
-
-      showMessage(
-        'AI found ${clips.length} clips.',
-      );
-    } catch (e) {
       setState(() {
-        errorMessage = e
-            .toString()
-            .replaceFirst('Exception: ', '');
+        testingConnection = false;
       });
-    } finally {
-      if (mounted) {
-        setState(() {
-          isAnalyzing = false;
-        });
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return true;
       }
-    }
-  }
 
-  bool isYouTubeUrl(String value) {
-    try {
-      final uri = Uri.parse(value);
+      showError(
+        'Server responded with HTTP ${response.statusCode}.\n\n'
+        '${response.body}',
+      );
 
-      final host = uri.host
-          .toLowerCase()
-          .replaceFirst('www.', '');
+      return false;
+    } on SocketException catch (e) {
+      if (!mounted) return false;
 
-      return host == 'youtube.com' ||
-          host == 'youtu.be' ||
-          host == 'm.youtube.com';
-    } catch (_) {
+      setState(() {
+        testingConnection = false;
+      });
+
+      showError(
+        'DNS / Internet connection error.\n\n'
+        'The phone could not connect to:\n'
+        '$serverUrl\n\n'
+        'Error:\n$e',
+      );
+
+      return false;
+    } on HttpException catch (e) {
+      if (!mounted) return false;
+
+      setState(() {
+        testingConnection = false;
+      });
+
+      showError('HTTP error:\n$e');
+      return false;
+    } on FormatException catch (e) {
+      if (!mounted) return false;
+
+      setState(() {
+        testingConnection = false;
+      });
+
+      showError('URL error:\n$e');
+      return false;
+    } catch (e) {
+      if (!mounted) return false;
+
+      setState(() {
+        testingConnection = false;
+      });
+
+      showError('Connection failed:\n$e');
       return false;
     }
   }
 
-  void showMessage(String message) {
+  Future<void> analyzeVideo() async {
+    if (loading) return;
+
+    final youtubeUrl = urlController.text.trim();
+
+    if (selectedVideo == null && youtubeUrl.isEmpty) {
+      showError('Upload a video or paste a YouTube URL first.');
+      return;
+    }
+
+    setState(() {
+      loading = true;
+      clips = [];
+    });
+
+    try {
+      // First check whether the APK can reach Render.
+      final serverOnline = await testServerConnection();
+
+      if (!serverOnline) {
+        setState(() {
+          loading = false;
+        });
+        return;
+      }
+
+      final uri = Uri.parse('$serverUrl/api/analyze');
+
+      final request = http.MultipartRequest('POST', uri);
+
+      request.fields['numberOfClips'] = getClipCount().toString();
+      request.fields['format'] = format;
+      request.fields['captions'] = captions;
+
+      if (youtubeUrl.isNotEmpty) {
+        request.fields['url'] = youtubeUrl;
+      }
+
+      if (selectedVideo != null) {
+        request.files.add(
+          await http.MultipartFile.fromPath(
+            'video',
+            selectedVideo!.path,
+          ),
+        );
+      }
+
+      final streamedResponse = await request.send().timeout(
+        const Duration(minutes: 10),
+      );
+
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (!mounted) return;
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final data = jsonDecode(response.body);
+
+        setState(() {
+          loading = false;
+          clips = data['clips'] ?? [];
+        });
+
+        if (clips.isEmpty) {
+          showError('The server finished, but no clips were returned.');
+        }
+      } else {
+        setState(() {
+          loading = false;
+        });
+
+        String message = response.body;
+
+        try {
+          final data = jsonDecode(response.body);
+          message = data['error']?.toString() ?? response.body;
+        } catch (_) {}
+
+        showError(
+          'Server error ${response.statusCode}:\n\n$message',
+        );
+      }
+    } on SocketException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        loading = false;
+      });
+
+      showError(
+        'Socket / DNS error.\n\n'
+        'The APK cannot resolve or connect to:\n'
+        '$serverUrl\n\n'
+        '$e',
+      );
+    } on TimeoutException catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        loading = false;
+      });
+
+      showError(
+        'Request timed out.\n\n'
+        'The server took too long to respond.',
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        loading = false;
+      });
+
+      showError('Unexpected error:\n\n$e');
+    }
+  }
+
+  void showError(String message) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ),
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('ClipAI Error'),
+          content: SingleChildScrollView(
+            child: SelectableText(message),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
     );
   }
 
   Widget buildDropdown({
-    required String label,
     required String value,
     required List<String> items,
     required ValueChanged<String?> onChanged,
   }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(
-            fontSize: 13,
-            color: Colors.white70,
-          ),
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF18181B),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.08),
         ),
-        const SizedBox(height: 8),
-        DropdownButtonFormField<String>(
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
           value: value,
           isExpanded: true,
-          decoration: InputDecoration(
-            filled: true,
-            fillColor: const Color(0xFF15151A),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide.none,
-            ),
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 16,
-              vertical: 14,
-            ),
-          ),
-          dropdownColor: const Color(0xFF19191F),
-          items: items.map((item) {
-            return DropdownMenuItem<String>(
-              value: item,
-              child: Text(item),
-            );
-          }).toList(),
+          dropdownColor: const Color(0xFF18181B),
+          items: items
+              .map(
+                (item) => DropdownMenuItem<String>(
+                  value: item,
+                  child: Text(item),
+                ),
+              )
+              .toList(),
           onChanged: onChanged,
         ),
-      ],
+      ),
+    );
+  }
+
+  Widget buildSectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
     );
   }
 
   Widget buildUploadCard() {
-    return InkWell(
-      onTap: pickVideo,
-      borderRadius: BorderRadius.circular(20),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(
-          horizontal: 20,
-          vertical: 28,
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121214),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.08),
         ),
-        decoration: BoxDecoration(
-          color: const Color(0xFF121217),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: Colors.white12,
+      ),
+      child: Column(
+        children: [
+          const Icon(
+            Icons.video_library_outlined,
+            size: 48,
           ),
-        ),
-        child: Column(
-          children: [
-            Container(
-              width: 58,
-              height: 58,
-              decoration: BoxDecoration(
-                color: const Color(0xFF201B35),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: const Icon(
-                Icons.video_library_rounded,
-                color: Color(0xFF9B7CFF),
-                size: 28,
-              ),
+          const SizedBox(height: 12),
+          const Text(
+            'Upload a video',
+            style: TextStyle(
+              fontSize: 19,
+              fontWeight: FontWeight.bold,
             ),
-            const SizedBox(height: 14),
-            Text(
-              selectedVideo == null
-                  ? 'Upload a video'
-                  : selectedVideo!.name,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-              ),
+          ),
+          const SizedBox(height: 7),
+          Text(
+            selectedVideo == null
+                ? 'MP4, MOV, WebM or MKV'
+                : selectedVideo!.path.split('/').last,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.55),
             ),
-            const SizedBox(height: 6),
-            Text(
-              selectedVideo == null
-                  ? 'MP4, MOV or WebM'
-                  : 'Video selected',
-              style: const TextStyle(
-                color: Colors.white54,
-                fontSize: 13,
-              ),
-            ),
-            const SizedBox(height: 16),
-            OutlinedButton(
-              onPressed: pickVideo,
-              child: const Text('Choose video'),
-            ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 16),
+          OutlinedButton.icon(
+            onPressed: loading ? null : pickVideo,
+            icon: const Icon(Icons.upload_file),
+            label: const Text('Choose video'),
+          ),
+        ],
       ),
     );
   }
 
   Widget buildUrlCard() {
     return Container(
+      width: double.infinity,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: const Color(0xFF121217),
-        borderRadius: BorderRadius.circular(20),
+        color: const Color(0xFF121214),
+        borderRadius: BorderRadius.circular(22),
         border: Border.all(
-          color: Colors.white12,
+          color: Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
-            children: [
-              Icon(
-                Icons.link_rounded,
-                color: Color(0xFF9B7CFF),
-              ),
-              SizedBox(width: 10),
-              Text(
-                'Video URL',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
+          const Text(
+            'Video URL',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 10),
           TextField(
             controller: urlController,
+            enabled: !loading,
             onChanged: (_) {
-              if (selectedVideo != null) {
+              if (urlController.text.trim().isNotEmpty &&
+                  selectedVideo != null) {
                 setState(() {
                   selectedVideo = null;
                 });
@@ -364,11 +438,9 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
             },
             decoration: InputDecoration(
               hintText: 'Paste YouTube URL',
+              prefixIcon: const Icon(Icons.link),
               filled: true,
-              fillColor: const Color(0xFF09090C),
-              prefixIcon: const Icon(
-                Icons.smart_display_outlined,
-              ),
+              fillColor: const Color(0xFF1B1B1F),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(14),
                 borderSide: BorderSide.none,
@@ -380,109 +452,44 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
     );
   }
 
-  Widget buildClipCard(dynamic clip, int index) {
-    final title =
-        clip is Map ? clip['title']?.toString() : null;
-
-    final score =
-        clip is Map ? clip['score']?.toString() : null;
-
-    final reason =
-        clip is Map ? clip['reason']?.toString() : null;
-
-    final start =
-        clip is Map ? clip['start']?.toString() : null;
-
-    final end =
-        clip is Map ? clip['end']?.toString() : null;
+  Widget buildResultCard(dynamic clip, int index) {
+    final title = clip['title']?.toString() ?? 'Clip ${index + 1}';
+    final score = clip['score']?.toString() ?? '-';
+    final url = clip['url']?.toString() ?? '';
 
     return Container(
+      width: double.infinity,
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF121217),
+        color: const Color(0xFF121214),
         borderRadius: BorderRadius.circular(18),
         border: Border.all(
-          color: Colors.white10,
+          color: Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF211A39),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Center(
-                  child: Text(
-                    '${index + 1}',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  title ?? 'Best Moment ${index + 1}',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w700,
-                    fontSize: 15,
-                  ),
-                ),
-              ),
-              if (score != null)
-                Text(
-                  '$score/100',
-                  style: const TextStyle(
-                    color: Color(0xFF9B7CFF),
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          if (reason != null && reason.isNotEmpty)
-            Text(
-              reason,
-              style: const TextStyle(
-                color: Colors.white60,
-                height: 1.4,
-              ),
+          Text(
+            title,
+            style: const TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 16,
             ),
-          const SizedBox(height: 12),
-          if (start != null && end != null)
-            Text(
-              '$start s → $end s',
-              style: const TextStyle(
-                color: Colors.white54,
+          ),
+          const SizedBox(height: 8),
+          Text('AI Score: $score'),
+          if (url.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            SelectableText(
+              url,
+              style: TextStyle(
+                color: Colors.deepPurple.shade200,
                 fontSize: 12,
               ),
             ),
-          const SizedBox(height: 12),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0B0B0E),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Text(
-              clip is Map && clip['url'] != null
-                  ? '$serverUrl${clip['url']}'
-                  : 'Clip generated',
-              style: const TextStyle(
-                color: Colors.white54,
-                fontSize: 11,
-              ),
-            ),
-          ),
+          ],
         ],
       ),
     );
@@ -499,76 +506,55 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
             fontWeight: FontWeight.w800,
           ),
         ),
+        centerTitle: false,
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(
-            18,
-            10,
-            18,
-            32,
-          ),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 30),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Turn long videos\ninto Shorts',
+                'Turn long videos into Shorts',
                 style: TextStyle(
-                  fontSize: 32,
-                  height: 1.05,
+                  fontSize: 28,
                   fontWeight: FontWeight.w900,
+                  height: 1.1,
                 ),
               ),
-              const SizedBox(height: 10),
-              const Text(
-                'AI finds the strongest moments automatically.',
+              const SizedBox(height: 8),
+              Text(
+                'AI finds the best moments automatically.',
                 style: TextStyle(
-                  color: Colors.white54,
+                  color: Colors.white.withOpacity(0.55),
                   fontSize: 15,
                 ),
               ),
+
               const SizedBox(height: 24),
 
               buildUrlCard(),
 
-              const SizedBox(height: 12),
+              const SizedBox(height: 14),
 
-              Row(
-                children: [
-                  const Expanded(
-                    child: Divider(
-                      color: Colors.white12,
-                    ),
+              const Center(
+                child: Text(
+                  'OR',
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontWeight: FontWeight.bold,
                   ),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: 12,
-                    ),
-                    child: Text(
-                      'OR',
-                      style: TextStyle(
-                        color: Colors.white38,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  const Expanded(
-                    child: Divider(
-                      color: Colors.white12,
-                    ),
-                  ),
-                ],
+                ),
               ),
 
-              const SizedBox(height: 12),
+              const SizedBox(height: 14),
 
               buildUploadCard(),
 
               const SizedBox(height: 24),
 
+              buildSectionTitle('Number of clips'),
               buildDropdown(
-                label: 'Number of clips',
                 value: numberOfClips,
                 items: const [
                   '1 clip',
@@ -577,52 +563,58 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
                   '10 clips',
                   '15 clips',
                 ],
-                onChanged: (value) {
-                  if (value != null) {
-                    setState(() {
-                      numberOfClips = value;
-                    });
-                  }
-                },
+                onChanged: loading
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          setState(() {
+                            numberOfClips = value;
+                          });
+                        }
+                      },
               ),
 
-              const SizedBox(height: 16),
+              const SizedBox(height: 18),
 
+              buildSectionTitle('Format'),
               buildDropdown(
-                label: 'Format',
-                value: videoFormat,
+                value: format,
                 items: const [
                   '9:16 Shorts',
                   '1:1 Square',
                   '16:9 Landscape',
                 ],
-                onChanged: (value) {
-                  if (value != null) {
-                    setState(() {
-                      videoFormat = value;
-                    });
-                  }
-                },
+                onChanged: loading
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          setState(() {
+                            format = value;
+                          });
+                        }
+                      },
               ),
 
-              const SizedBox(height: 16),
+              const SizedBox(height: 18),
 
+              buildSectionTitle('Captions'),
               buildDropdown(
-                label: 'Captions',
-                value: captionsStyle,
+                value: captions,
                 items: const [
                   'Animated',
                   'Bold',
                   'Minimal',
                   'None',
                 ],
-                onChanged: (value) {
-                  if (value != null) {
-                    setState(() {
-                      captionsStyle = value;
-                    });
-                  }
-                },
+                onChanged: loading
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          setState(() {
+                            captions = value;
+                          });
+                        }
+                      },
               ),
 
               const SizedBox(height: 24),
@@ -630,58 +622,48 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
               SizedBox(
                 width: double.infinity,
                 height: 56,
-                child: FilledButton.icon(
+                child: FilledButton(
                   onPressed:
-                      isAnalyzing ? null : analyzeVideo,
-                  icon: isAnalyzing
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                          ),
+                      loading || testingConnection ? null : analyzeVideo,
+                  child: loading
+                      ? const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 21,
+                              height: 21,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.5,
+                              ),
+                            ),
+                            SizedBox(width: 12),
+                            Text('Finding best clips...'),
+                          ],
                         )
-                      : const Icon(
-                          Icons.auto_awesome,
-                        ),
-                  label: Text(
-                    isAnalyzing
-                        ? 'AI is finding the best clips...'
-                        : 'Find Best Clips',
-                  ),
+                      : testingConnection
+                          ? const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: 21,
+                                  height: 21,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2.5,
+                                  ),
+                                ),
+                                SizedBox(width: 12),
+                                Text('Connecting...'),
+                              ],
+                            )
+                          : const Text(
+                              'Find Best Clips',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
                 ),
               ),
-
-              if (isAnalyzing) ...[
-                const SizedBox(height: 18),
-                const LinearProgressIndicator(),
-                const SizedBox(height: 8),
-                const Text(
-                  'Transcribing video and analyzing moments...',
-                  style: TextStyle(
-                    color: Colors.white54,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-
-              if (errorMessage != null) ...[
-                const SizedBox(height: 18),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF32171A),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: Text(
-                    errorMessage!,
-                    style: const TextStyle(
-                      color: Colors.redAccent,
-                    ),
-                  ),
-                ),
-              ],
 
               if (clips.isNotEmpty) ...[
                 const SizedBox(height: 30),
@@ -695,7 +677,7 @@ class _ClipMakerPageState extends State<ClipMakerPage> {
                 const SizedBox(height: 12),
                 ...List.generate(
                   clips.length,
-                  (index) => buildClipCard(
+                  (index) => buildResultCard(
                     clips[index],
                     index,
                   ),

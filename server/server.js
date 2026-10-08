@@ -1,755 +1,618 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import OpenAI from "openai";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import ytDlp from "yt-dlp-exec";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegStatic from "ffmpeg-static";
+import ytDlp from "yt-dlp-exec";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-
 const app = express();
+const PORT = process.env.PORT || 10000;
+
+ffmpeg.setFfmpegPath(ffmpegStatic);
+
+const uploadsDir = path.join(__dirname, "uploads");
+const outputsDir = path.join(__dirname, "outputs");
+
+fs.mkdirSync(uploadsDir, { recursive: true });
+fs.mkdirSync(outputsDir, { recursive: true });
 
 app.use(cors());
-app.use(express.json());
-
-const uploadDir = path.join(__dirname, "uploads");
-const outputDir = path.join(__dirname, "outputs");
-
-fs.mkdirSync(uploadDir, { recursive: true });
-fs.mkdirSync(outputDir, { recursive: true });
+app.use(express.json({ limit: "10mb" }));
+app.use("/outputs", express.static(outputsDir));
 
 const upload = multer({
-  dest: uploadDir,
+  dest: uploadsDir,
   limits: {
-    fileSize: 500 * 1024 * 1024
-  }
+    fileSize: 500 * 1024 * 1024,
+  },
 });
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-/* =========================
-   HOME
-========================= */
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    message: "ClipAI server is running"
+    message: "ClipAI server is running",
   });
 });
 
-/* =========================
-   ANALYZE
-========================= */
+/* ----------------------------- */
+/* Helpers */
+/* ----------------------------- */
+
+function safeNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function cleanup(file) {
+  try {
+    if (file && fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  } catch {}
+}
+
+function extractJson(text) {
+  let cleaned = String(text || "").trim();
+
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  const first = cleaned.indexOf("{");
+  const last = cleaned.lastIndexOf("}");
+
+  if (first !== -1 && last !== -1) {
+    cleaned = cleaned.slice(first, last + 1);
+  }
+
+  return JSON.parse(cleaned);
+}
+
+/* ----------------------------- */
+/* Gemini */
+/* ----------------------------- */
+
+async function geminiRequest(prompt) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not configured on Render.");
+  }
+
+  const models = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+  ];
+
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: prompt,
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.2,
+              responseMimeType: "application/json",
+            },
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        lastError = new Error(
+          `Gemini ${model} error ${response.status}: ${
+            data?.error?.message || JSON.stringify(data)
+          }`
+        );
+        continue;
+      }
+
+      const text =
+        data?.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || "")
+          .join("") || "";
+
+      if (!text) {
+        throw new Error("Gemini returned an empty response.");
+      }
+
+      return text;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Gemini request failed.");
+}
+
+/* ----------------------------- */
+/* Video information */
+/* ----------------------------- */
+
+function getVideoDuration(videoPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (error, metadata) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      const duration = Number(metadata?.format?.duration || 0);
+
+      if (!duration) {
+        reject(new Error("Could not determine video duration."));
+        return;
+      }
+
+      resolve(duration);
+    });
+  });
+}
+
+/* ----------------------------- */
+/* Extract audio */
+/* ----------------------------- */
+
+function extractAudio(videoPath, audioPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(videoPath)
+      .noVideo()
+      .audioCodec("pcm_s16le")
+      .audioFrequency(16000)
+      .audioChannels(1)
+      .format("wav")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(audioPath);
+  });
+}
+
+/* ----------------------------- */
+/* Transcription */
+/* ----------------------------- */
+
+/*
+  This expects the server to have a Whisper executable available.
+
+  Environment variable:
+  WHISPER_COMMAND
+
+  Example:
+  whisper
+
+  The actual command can be configured on Render later.
+*/
+
+async function transcribeAudio(audioPath) {
+  const whisperCommand = process.env.WHISPER_COMMAND || "whisper";
+
+  const transcriptDir = path.join(
+    uploadsDir,
+    `transcript-${Date.now()}`
+  );
+
+  fs.mkdirSync(transcriptDir, { recursive: true });
+
+  try {
+    const { spawn } = await import("child_process");
+
+    await new Promise((resolve, reject) => {
+      const args = [
+        audioPath,
+        "--model",
+        "base",
+        "--output_format",
+        "json",
+        "--output_dir",
+        transcriptDir,
+        "--language",
+        "en",
+      ];
+
+      const process = spawn(whisperCommand, args);
+
+      let stderr = "";
+
+      process.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      process.on("error", reject);
+
+      process.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `Whisper failed with exit code ${code}: ${stderr}`
+            )
+          );
+        }
+      });
+    });
+
+    const jsonFiles = fs
+      .readdirSync(transcriptDir)
+      .filter((file) => file.endsWith(".json"));
+
+    if (!jsonFiles.length) {
+      throw new Error("Whisper did not produce a transcript JSON file.");
+    }
+
+    const transcriptFile = path.join(
+      transcriptDir,
+      jsonFiles[0]
+    );
+
+    const data = JSON.parse(
+      fs.readFileSync(transcriptFile, "utf8")
+    );
+
+    const segments = Array.isArray(data.segments)
+      ? data.segments
+          .map((segment) => ({
+            start: Number(segment.start || 0),
+            end: Number(segment.end || 0),
+            text: String(segment.text || "").trim(),
+          }))
+          .filter((segment) => segment.text)
+      : [];
+
+    if (!segments.length) {
+      throw new Error("No speech was detected in the video.");
+    }
+
+    return segments;
+  } finally {
+    fs.rmSync(transcriptDir, {
+      recursive: true,
+      force: true,
+    });
+  }
+}
+
+/* ----------------------------- */
+/* Gemini clip selection */
+/* ----------------------------- */
+
+async function findBestClips(segments, numberOfClips, duration) {
+  const transcript = segments
+    .map(
+      (s) =>
+        `[${s.start.toFixed(2)} - ${s.end.toFixed(2)}] ${s.text}`
+    )
+    .join("\n");
+
+  const prompt = `
+You are the AI clip-selection engine for ClipAI.
+
+Analyze this transcript and find the ${numberOfClips} strongest moments
+for YouTube Shorts / TikTok / Instagram Reels.
+
+Goal:
+Choose moments that have a strong hook, emotion, curiosity,
+useful information, surprising statements, conflict, storytelling,
+or a satisfying payoff.
+
+Rules:
+
+1. Each clip must be between 20 and 60 seconds.
+2. Use the exact timestamps from the transcript.
+3. Do not invent timestamps.
+4. Clips must stay inside the video duration.
+5. Prefer moments that can work independently.
+6. Avoid introductions, greetings, silence and filler.
+7. Avoid overlapping clips.
+8. Start as close as possible to the beginning of the interesting statement.
+9. End after the payoff, not in the middle of a sentence.
+10. Rank the clips by viral potential.
+
+Return ONLY valid JSON:
+
+{
+  "clips": [
+    {
+      "start": 0,
+      "end": 30,
+      "score": 95,
+      "title": "Short descriptive title",
+      "reason": "Why this moment is strong"
+    }
+  ]
+}
+
+Video duration: ${duration} seconds.
+
+TRANSCRIPT:
+${transcript}
+`;
+
+  const raw = await geminiRequest(prompt);
+
+  const parsed = extractJson(raw);
+
+  if (!Array.isArray(parsed.clips)) {
+    throw new Error("Gemini did not return a clips array.");
+  }
+
+  const clips = parsed.clips
+    .map((clip) => ({
+      start: Math.max(0, safeNumber(clip.start, 0)),
+      end: Math.min(
+        duration,
+        safeNumber(clip.end, 0)
+      ),
+      score: safeNumber(clip.score, 0),
+      title: String(clip.title || "Clip"),
+      reason: String(clip.reason || ""),
+    }))
+    .filter(
+      (clip) =>
+        clip.end > clip.start &&
+        clip.end - clip.start >= 20 &&
+        clip.end - clip.start <= 60
+    )
+    .sort((a, b) => b.score - a.score);
+
+  return clips.slice(0, numberOfClips);
+}
+
+/* ----------------------------- */
+/* Create MP4 clip */
+/* ----------------------------- */
+
+function createClip(input, output, start, duration, format) {
+  return new Promise((resolve, reject) => {
+    let command = ffmpeg(input)
+      .seekInput(start)
+      .duration(duration)
+      .videoCodec("libx264")
+      .audioCodec("aac")
+      .outputOptions([
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart",
+      ]);
+
+    /*
+      9:16 vertical crop.
+      We keep the original center for now.
+      Later we can add AI face tracking.
+    */
+
+    if (format === "9:16") {
+      command = command
+        .videoFilters(
+          "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        );
+    }
+
+    if (format === "1:1") {
+      command = command
+        .videoFilters(
+          "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+        );
+    }
+
+    if (format === "16:9") {
+      command = command
+        .videoFilters(
+          "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
+        );
+    }
+
+    command
+      .on("end", resolve)
+      .on("error", reject)
+      .save(output);
+  });
+}
+
+/* ----------------------------- */
+/* Download YouTube */
+/* ----------------------------- */
+
+async function downloadYouTube(url, outputBase) {
+  const allowedHosts = [
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "m.youtube.com",
+  ];
+
+  const parsed = new URL(url);
+
+  if (!allowedHosts.includes(parsed.hostname)) {
+    throw new Error("Only YouTube URLs are supported.");
+  }
+
+  const output = `${outputBase}.%(ext)s`;
+
+  await ytDlp(url, {
+    output,
+    format: "best[height<=720]/best",
+    mergeOutputFormat: "mp4",
+    noPlaylist: true,
+    noWarnings: true,
+    quiet: true,
+    restrictFilenames: true,
+    ffmpegLocation: ffmpegStatic,
+  });
+
+  const files = fs
+    .readdirSync(uploadsDir)
+    .filter((file) =>
+      file.startsWith(path.basename(outputBase))
+    );
+
+  if (!files.length) {
+    throw new Error("YouTube video was not downloaded.");
+  }
+
+  return path.join(uploadsDir, files[0]);
+}
+
+/* ----------------------------- */
+/* Analyze */
+/* ----------------------------- */
 
 app.post(
   "/api/analyze",
   upload.single("video"),
   async (req, res) => {
-
     let videoPath = null;
     let audioPath = null;
-    let downloadedFromUrl = false;
 
     try {
+      const url = String(req.body?.url || "").trim();
 
-      if (!process.env.OPENAI_API_KEY) {
-        return res.status(500).json({
-          error: "OPENAI_API_KEY is not configured"
-        });
-      }
-
-      const videoUrl =
-        typeof req.body?.url === "string"
-          ? req.body.url.trim()
-          : "";
-
-      /* =========================
-         GET VIDEO
-      ========================= */
-
-      if (req.file) {
-
-        console.log("Using uploaded video");
-
-        videoPath = req.file.path;
-
-      } else if (videoUrl) {
-
-        console.log("Video URL received");
-
-        if (!isAllowedVideoUrl(videoUrl)) {
-          return res.status(400).json({
-            error:
-              "Only supported video URLs are allowed."
-          });
-        }
-
-        const downloadedPath =
-          await downloadVideo(videoUrl);
-
-        videoPath = downloadedPath;
-        downloadedFromUrl = true;
-
-      } else {
-
-        return res.status(400).json({
-          error:
-            "Upload a video or provide a video URL."
-        });
-      }
-
-      /* =========================
-         EXTRACT AUDIO
-      ========================= */
-
-      audioPath = path.join(
-        uploadDir,
-        `audio-${Date.now()}.mp3`
+      const numberOfClips = Math.min(
+        15,
+        Math.max(
+          1,
+          parseInt(req.body?.numberOfClips || "5", 10)
+        )
       );
 
-      console.log("Extracting audio...");
+      const format = String(
+        req.body?.format || "9:16"
+      );
+
+      if (req.file) {
+        videoPath = req.file.path;
+      } else if (url) {
+        const base = path.join(
+          uploadsDir,
+          `download-${Date.now()}`
+        );
+
+        videoPath = await downloadYouTube(
+          url,
+          base
+        );
+      } else {
+        return res.status(400).json({
+          error: "Upload a video or provide a YouTube URL.",
+        });
+      }
+
+      const duration = await getVideoDuration(
+        videoPath
+      );
+
+      audioPath = path.join(
+        uploadsDir,
+        `audio-${Date.now()}.wav`
+      );
 
       await extractAudio(
         videoPath,
         audioPath
       );
 
-      /* =========================
-         TRANSCRIPTION
-      ========================= */
+      const segments = await transcribeAudio(
+        audioPath
+      );
 
-      console.log("Transcribing video...");
+      const clips = await findBestClips(
+        segments,
+        numberOfClips,
+        duration
+      );
 
-      const transcription =
-        await openai.audio.transcriptions.create({
-          file: fs.createReadStream(audioPath),
-          model: "gpt-transcribe",
-          response_format: "verbose_json",
-          timestamp_granularities: ["segment"]
-        });
-
-      const segments =
-        (transcription.segments || [])
-          .map((segment) => ({
-            start: Number(segment.start),
-            end: Number(segment.end),
-            text: String(segment.text || "").trim()
-          }))
-          .filter(
-            (segment) =>
-              Number.isFinite(segment.start) &&
-              Number.isFinite(segment.end) &&
-              segment.end > segment.start &&
-              segment.text.length > 0
-          );
-
-      if (!segments.length) {
+      if (!clips.length) {
         throw new Error(
-          "No speech segments were detected."
+          "AI could not find suitable clips."
         );
       }
 
-      console.log(
-        `Found ${segments.length} transcript segments`
-      );
+      const results = [];
 
-      /* =========================
-         NUMBER OF CLIPS
-      ========================= */
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
 
-      let numberOfClips =
-        Number(req.body?.numberOfClips || 5);
+        const outputName =
+          `clip-${Date.now()}-${i + 1}.mp4`;
 
-      if (
-        !Number.isFinite(numberOfClips) ||
-        numberOfClips < 1
-      ) {
-        numberOfClips = 5;
-      }
-
-      numberOfClips =
-        Math.min(numberOfClips, 15);
-
-      /* =========================
-         TRANSCRIPT FOR AI
-      ========================= */
-
-      const transcriptForAI =
-        segments
-          .map(
-            (s, i) =>
-              `[${i}] ${s.start.toFixed(2)}-${s.end.toFixed(2)}: ${s.text}`
-          )
-          .join("\n");
-
-      console.log(
-        "AI is selecting the best moments..."
-      );
-
-      /* =========================
-         AI CLIP SELECTION
-      ========================= */
-
-      const aiResponse =
-        await openai.responses.create({
-
-          model: "gpt-5.6-sol",
-
-          input: [
-
-            {
-              role: "system",
-
-              content: `
-You are an expert short-form video editor.
-
-Your job is to find the strongest moments
-from a long-form video transcript.
-
-Choose moments that have high potential
-for Shorts/Reels/TikTok.
-
-Look for:
-
-- extremely strong hooks
-- surprising statements
-- emotional moments
-- useful information
-- curiosity
-- controversy
-- storytelling
-- unexpected facts
-- strong opinions
-- funny moments
-- strong payoffs
-- moments that make viewers want to keep watching
-
-Avoid:
-
-- greetings
-- introductions without value
-- filler
-- repetitive statements
-- long explanations without a payoff
-- incomplete thoughts
-- moments that need missing context
-
-Each clip should normally be
-20-60 seconds.
-
-A clip may be slightly shorter or longer
-if necessary for a complete thought.
-
-Start slightly before the important statement
-when necessary.
-
-End after the payoff.
-
-Use ONLY timestamps contained
-in the transcript.
-
-NEVER invent timestamps.
-
-Clips must not overlap.
-
-Return the strongest clips first.
-
-Score each clip from 0 to 100.
-`
-            },
-
-            {
-              role: "user",
-
-              content: `
-Find the ${numberOfClips} strongest clips.
-
-TRANSCRIPT:
-
-${transcriptForAI}
-`
-            }
-          ],
-
-          text: {
-            format: {
-              type: "json_schema",
-
-              name: "clip_selection",
-
-              strict: true,
-
-              schema: {
-
-                type: "object",
-
-                properties: {
-
-                  clips: {
-
-                    type: "array",
-
-                    items: {
-
-                      type: "object",
-
-                      properties: {
-
-                        start: {
-                          type: "number"
-                        },
-
-                        end: {
-                          type: "number"
-                        },
-
-                        title: {
-                          type: "string"
-                        },
-
-                        score: {
-                          type: "number"
-                        },
-
-                        reason: {
-                          type: "string"
-                        }
-
-                      },
-
-                      required: [
-                        "start",
-                        "end",
-                        "title",
-                        "score",
-                        "reason"
-                      ],
-
-                      additionalProperties: false
-                    }
-                  }
-                },
-
-                required: [
-                  "clips"
-                ],
-
-                additionalProperties: false
-              }
-            }
-          }
-        });
-
-      const result =
-        JSON.parse(
-          aiResponse.output_text
-        );
-
-      console.log(
-        `AI selected ${result.clips.length} clips`
-      );
-
-      /* =========================
-         CREATE CLIPS
-      ========================= */
-
-      const clips = [];
-
-      for (
-        let i = 0;
-        i < result.clips.length;
-        i++
-      ) {
-
-        const clip = result.clips[i];
-
-        const start =
-          Math.max(
-            0,
-            Number(clip.start)
-          );
-
-        const end =
-          Number(clip.end);
-
-        if (
-          !Number.isFinite(start) ||
-          !Number.isFinite(end) ||
-          end <= start ||
-          end - start < 5
-        ) {
-          continue;
-        }
-
-        const duration =
-          end - start;
-
-        const outputFile =
-          path.join(
-            outputDir,
-            `${Date.now()}-clip-${i + 1}.mp4`
-          );
-
-        console.log(
-          `Creating clip ${i + 1}: ${start}s - ${end}s`
+        const outputPath = path.join(
+          outputsDir,
+          outputName
         );
 
         await createClip(
           videoPath,
-          outputFile,
-          start,
-          duration
+          outputPath,
+          clip.start,
+          clip.end - clip.start,
+          format
         );
 
-        clips.push({
-
+        results.push({
           id: i + 1,
-
-          title:
-            clip.title ||
-            `Best Moment ${i + 1}`,
-
-          score:
-            Number(clip.score) || 0,
-
-          reason:
-            clip.reason || "",
-
-          start,
-
-          end,
-
+          title: clip.title,
+          reason: clip.reason,
+          score: clip.score,
+          start: clip.start,
+          end: clip.end,
+          duration:
+            clip.end - clip.start,
           url:
-            `/outputs/${path.basename(
-              outputFile
-            )}`
+            `${req.protocol}://${req.get("host")}/outputs/${outputName}`,
         });
       }
 
-      /* =========================
-         RESPONSE
-      ========================= */
-
-      res.json({
-
+      return res.json({
         success: true,
-
-        transcript:
-          transcription.text || "",
-
-        clips
+        ai: "gemini",
+        duration,
+        clips: results,
       });
-
     } catch (error) {
+      console.error(error);
 
-      console.error(
-        "ANALYZE ERROR:",
-        error
-      );
-
-      res.status(500).json({
-
-        success: false,
-
+      return res.status(500).json({
         error:
           error?.message ||
-          "Video processing failed."
+          "Server error",
       });
-
     } finally {
-
-      /* =========================
-         CLEAN TEMP FILES
-      ========================= */
-
-      if (
-        audioPath &&
-        fs.existsSync(audioPath)
-      ) {
-
-        try {
-          fs.unlinkSync(audioPath);
-        } catch (_) {}
-
-      }
-
-      if (
-        videoPath &&
-        downloadedFromUrl &&
-        fs.existsSync(videoPath)
-      ) {
-
-        try {
-          fs.unlinkSync(videoPath);
-        } catch (_) {}
-
-      }
-
-      if (
-        videoPath &&
-        req.file &&
-        fs.existsSync(videoPath)
-      ) {
-
-        try {
-          fs.unlinkSync(videoPath);
-        } catch (_) {}
-
-      }
+      cleanup(videoPath);
+      cleanup(audioPath);
     }
   }
 );
 
-/* =========================
-   OUTPUTS
-========================= */
-
-app.use(
-  "/outputs",
-  express.static(outputDir)
-);
-
-/* =========================
-   SERVER
-========================= */
-
-const PORT =
-  process.env.PORT || 3000;
-
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `ClipAI server running on port ${PORT}`
-    );
-
-  }
-);
-
-/* =========================
-   URL VALIDATION
-========================= */
-
-function isAllowedVideoUrl(url) {
-
-  try {
-
-    const parsed =
-      new URL(url);
-
-    const hostname =
-      parsed.hostname
-        .toLowerCase()
-        .replace(/^www\./, "");
-
-    return (
-      hostname === "youtube.com" ||
-      hostname === "youtu.be" ||
-      hostname === "m.youtube.com"
-    );
-
-  } catch (_) {
-
-    return false;
-
-  }
-}
-
-/* =========================
-   DOWNLOAD VIDEO FROM URL
-========================= */
-
-async function downloadVideo(url) {
-
-  const id =
-    `download-${Date.now()}`;
-
-  const outputTemplate =
-    path.join(
-      uploadDir,
-      `${id}.%(ext)s`
-    );
-
+app.listen(PORT, () => {
   console.log(
-    "Downloading authorized video..."
+    `ClipAI server running on port ${PORT}`
   );
-
-  await ytDlp(
-    url,
-    {
-
-      output:
-        outputTemplate,
-
-      format:
-        "best[height<=720]/best",
-
-      mergeOutputFormat:
-        "mp4",
-
-      noPlaylist:
-        true,
-
-      noWarnings:
-        true,
-
-      quiet:
-        true,
-
-      restrictFilenames:
-        true,
-
-      ffmpegLocation:
-        path.dirname(ffmpegPath)
-
-    }
-  );
-
-  const files =
-    fs.readdirSync(uploadDir);
-
-  const downloaded =
-    files.find(
-      (file) =>
-        file.startsWith(`${id}.`)
-    );
-
-  if (!downloaded) {
-
-    throw new Error(
-      "Could not download the video."
-    );
-
-  }
-
-  const downloadedPath =
-    path.join(
-      uploadDir,
-      downloaded
-    );
-
-  console.log(
-    `Video downloaded: ${downloadedPath}`
-  );
-
-  return downloadedPath;
-}
-
-/* =========================
-   EXTRACT AUDIO
-========================= */
-
-function extractAudio(
-  video,
-  audio
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      ffmpeg(video)
-
-        .noVideo()
-
-        .audioCodec(
-          "libmp3lame"
-        )
-
-        .audioFrequency(
-          16000
-        )
-
-        .audioChannels(
-          1
-        )
-
-        .format("mp3")
-
-        .on(
-          "end",
-          resolve
-        )
-
-        .on(
-          "error",
-          reject
-        )
-
-        .save(audio);
-
-    }
-  );
-}
-
-/* =========================
-   CREATE CLIP
-========================= */
-
-function createClip(
-  video,
-  output,
-  start,
-  duration
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      ffmpeg(video)
-
-        .setStartTime(
-          start
-        )
-
-        .setDuration(
-          duration
-        )
-
-        .videoCodec(
-          "libx264"
-        )
-
-        .audioCodec(
-          "aac"
-        )
-
-        .outputOptions([
-
-          "-preset",
-          "veryfast",
-
-          "-crf",
-          "23",
-
-          "-movflags",
-          "+faststart"
-
-        ])
-
-        .on(
-          "end",
-          resolve
-        )
-
-        .on(
-          "error",
-          reject
-        )
-
-        .save(output);
-
-    }
-  );
-}
+});

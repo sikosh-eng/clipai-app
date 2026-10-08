@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 import ytDlp from "yt-dlp-exec";
+import { GoogleGenAI } from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,10 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
 
 const uploadsDir = path.join(__dirname, "uploads");
 const outputsDir = path.join(__dirname, "outputs");
@@ -37,17 +42,9 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "ClipAI server is running",
+    ai: "Gemini",
   });
 });
-
-/* ----------------------------- */
-/* Helpers */
-/* ----------------------------- */
-
-function safeNumber(value, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
 
 function cleanup(file) {
   try {
@@ -56,103 +53,6 @@ function cleanup(file) {
     }
   } catch {}
 }
-
-function extractJson(text) {
-  let cleaned = String(text || "").trim();
-
-  cleaned = cleaned
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-
-  const first = cleaned.indexOf("{");
-  const last = cleaned.lastIndexOf("}");
-
-  if (first !== -1 && last !== -1) {
-    cleaned = cleaned.slice(first, last + 1);
-  }
-
-  return JSON.parse(cleaned);
-}
-
-/* ----------------------------- */
-/* Gemini */
-/* ----------------------------- */
-
-async function geminiRequest(prompt) {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured on Render.");
-  }
-
-  const models = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-  ];
-
-  let lastError = null;
-
-  for (const model of models) {
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: prompt,
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              temperature: 0.2,
-              responseMimeType: "application/json",
-            },
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        lastError = new Error(
-          `Gemini ${model} error ${response.status}: ${
-            data?.error?.message || JSON.stringify(data)
-          }`
-        );
-        continue;
-      }
-
-      const text =
-        data?.candidates?.[0]?.content?.parts
-          ?.map((p) => p.text || "")
-          .join("") || "";
-
-      if (!text) {
-        throw new Error("Gemini returned an empty response.");
-      }
-
-      return text;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("Gemini request failed.");
-}
-
-/* ----------------------------- */
-/* Video information */
-/* ----------------------------- */
 
 function getVideoDuration(videoPath) {
   return new Promise((resolve, reject) => {
@@ -174,220 +74,159 @@ function getVideoDuration(videoPath) {
   });
 }
 
-/* ----------------------------- */
-/* Extract audio */
-/* ----------------------------- */
+function extractJson(text) {
+  let result = String(text || "").trim();
 
-function extractAudio(videoPath, audioPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
-      .noVideo()
-      .audioCodec("pcm_s16le")
-      .audioFrequency(16000)
-      .audioChannels(1)
-      .format("wav")
-      .on("end", resolve)
-      .on("error", reject)
-      .save(audioPath);
-  });
+  result = result
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  const start = result.indexOf("{");
+  const end = result.lastIndexOf("}");
+
+  if (start !== -1 && end !== -1) {
+    result = result.substring(start, end + 1);
+  }
+
+  return JSON.parse(result);
 }
 
-/* ----------------------------- */
-/* Transcription */
-/* ----------------------------- */
+/* ================================= */
+/* GEMINI VIDEO ANALYSIS */
+/* ================================= */
 
-/*
-  This expects the server to have a Whisper executable available.
+async function analyzeVideoWithGemini(videoPath, numberOfClips) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is missing on Render.");
+  }
 
-  Environment variable:
-  WHISPER_COMMAND
+  console.log("Uploading video to Gemini...");
 
-  Example:
-  whisper
+  let videoFile = await ai.files.upload({
+    file: videoPath,
+    config: {
+      mimeType: "video/mp4",
+    },
+  });
 
-  The actual command can be configured on Render later.
-*/
+  console.log("Gemini file:", videoFile.name);
 
-async function transcribeAudio(audioPath) {
-  const whisperCommand = process.env.WHISPER_COMMAND || "whisper";
+  while (videoFile.state === "PROCESSING") {
+    console.log("Gemini is processing the video...");
 
-  const transcriptDir = path.join(
-    uploadsDir,
-    `transcript-${Date.now()}`
-  );
-
-  fs.mkdirSync(transcriptDir, { recursive: true });
-
-  try {
-    const { spawn } = await import("child_process");
-
-    await new Promise((resolve, reject) => {
-      const args = [
-        audioPath,
-        "--model",
-        "base",
-        "--output_format",
-        "json",
-        "--output_dir",
-        transcriptDir,
-        "--language",
-        "en",
-      ];
-
-      const process = spawn(whisperCommand, args);
-
-      let stderr = "";
-
-      process.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
-
-      process.on("error", reject);
-
-      process.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(
-            new Error(
-              `Whisper failed with exit code ${code}: ${stderr}`
-            )
-          );
-        }
-      });
-    });
-
-    const jsonFiles = fs
-      .readdirSync(transcriptDir)
-      .filter((file) => file.endsWith(".json"));
-
-    if (!jsonFiles.length) {
-      throw new Error("Whisper did not produce a transcript JSON file.");
-    }
-
-    const transcriptFile = path.join(
-      transcriptDir,
-      jsonFiles[0]
+    await new Promise((resolve) =>
+      setTimeout(resolve, 3000)
     );
 
-    const data = JSON.parse(
-      fs.readFileSync(transcriptFile, "utf8")
-    );
-
-    const segments = Array.isArray(data.segments)
-      ? data.segments
-          .map((segment) => ({
-            start: Number(segment.start || 0),
-            end: Number(segment.end || 0),
-            text: String(segment.text || "").trim(),
-          }))
-          .filter((segment) => segment.text)
-      : [];
-
-    if (!segments.length) {
-      throw new Error("No speech was detected in the video.");
-    }
-
-    return segments;
-  } finally {
-    fs.rmSync(transcriptDir, {
-      recursive: true,
-      force: true,
+    videoFile = await ai.files.get({
+      name: videoFile.name,
     });
   }
-}
 
-/* ----------------------------- */
-/* Gemini clip selection */
-/* ----------------------------- */
+  if (videoFile.state === "FAILED") {
+    throw new Error("Gemini failed to process the video.");
+  }
 
-async function findBestClips(segments, numberOfClips, duration) {
-  const transcript = segments
-    .map(
-      (s) =>
-        `[${s.start.toFixed(2)} - ${s.end.toFixed(2)}] ${s.text}`
-    )
-    .join("\n");
+  console.log("Gemini video is ready.");
 
   const prompt = `
-You are the AI clip-selection engine for ClipAI.
+You are ClipAI, an AI editor that finds viral short-form clips.
 
-Analyze this transcript and find the ${numberOfClips} strongest moments
-for YouTube Shorts / TikTok / Instagram Reels.
+Analyze the entire video including:
+- spoken words
+- audio
+- visual events
+- emotions
+- surprises
+- storytelling
+- useful information
+- controversial or interesting statements
+- strong hooks
+- payoffs
 
-Goal:
-Choose moments that have a strong hook, emotion, curiosity,
-useful information, surprising statements, conflict, storytelling,
-or a satisfying payoff.
+Find the ${numberOfClips} BEST independent moments for:
+YouTube Shorts, TikTok and Instagram Reels.
 
-Rules:
+IMPORTANT TIMESTAMP RULES:
 
-1. Each clip must be between 20 and 60 seconds.
-2. Use the exact timestamps from the transcript.
-3. Do not invent timestamps.
-4. Clips must stay inside the video duration.
-5. Prefer moments that can work independently.
-6. Avoid introductions, greetings, silence and filler.
-7. Avoid overlapping clips.
-8. Start as close as possible to the beginning of the interesting statement.
-9. End after the payoff, not in the middle of a sentence.
-10. Rank the clips by viral potential.
+- Return exact timestamps from the video.
+- Every clip must be 20 to 60 seconds.
+- Do not invent timestamps.
+- Do not make clips overlap.
+- Start slightly before the important statement.
+- End after the payoff.
+- Avoid greetings and boring introductions.
+- Avoid long silence.
+- Prefer moments with strong retention potential.
 
-Return ONLY valid JSON:
+Rank clips by viral potential.
+
+Return ONLY this JSON:
 
 {
   "clips": [
     {
-      "start": 0,
-      "end": 30,
-      "score": 95,
-      "title": "Short descriptive title",
-      "reason": "Why this moment is strong"
+      "start": 12.5,
+      "end": 47.2,
+      "score": 96,
+      "title": "Short title",
+      "reason": "Why this moment could perform well"
     }
   ]
 }
-
-Video duration: ${duration} seconds.
-
-TRANSCRIPT:
-${transcript}
 `;
 
-  const raw = await geminiRequest(prompt);
+  console.log("Asking Gemini to find the best clips...");
 
-  const parsed = extractJson(raw);
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [
+      {
+        fileData: {
+          fileUri: videoFile.uri,
+          mimeType: videoFile.mimeType,
+        },
+      },
+      {
+        text: prompt,
+      },
+    ],
+    config: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+    },
+  });
 
-  if (!Array.isArray(parsed.clips)) {
-    throw new Error("Gemini did not return a clips array.");
+  const text = response.text;
+
+  if (!text) {
+    throw new Error("Gemini returned an empty response.");
   }
 
-  const clips = parsed.clips
-    .map((clip) => ({
-      start: Math.max(0, safeNumber(clip.start, 0)),
-      end: Math.min(
-        duration,
-        safeNumber(clip.end, 0)
-      ),
-      score: safeNumber(clip.score, 0),
-      title: String(clip.title || "Clip"),
-      reason: String(clip.reason || ""),
-    }))
-    .filter(
-      (clip) =>
-        clip.end > clip.start &&
-        clip.end - clip.start >= 20 &&
-        clip.end - clip.start <= 60
-    )
-    .sort((a, b) => b.score - a.score);
+  console.log("Gemini response received.");
 
-  return clips.slice(0, numberOfClips);
+  const data = extractJson(text);
+
+  if (!Array.isArray(data.clips)) {
+    throw new Error("Gemini did not return clips.");
+  }
+
+  return data.clips;
 }
 
-/* ----------------------------- */
-/* Create MP4 clip */
-/* ----------------------------- */
+/* ================================= */
+/* CREATE SHORT */
+/* ================================= */
 
-function createClip(input, output, start, duration, format) {
+function createClip(
+  input,
+  output,
+  start,
+  duration,
+  format
+) {
   return new Promise((resolve, reject) => {
     let command = ffmpeg(input)
       .seekInput(start)
@@ -403,45 +242,41 @@ function createClip(input, output, start, duration, format) {
         "+faststart",
       ]);
 
-    /*
-      9:16 vertical crop.
-      We keep the original center for now.
-      Later we can add AI face tracking.
-    */
-
     if (format === "9:16") {
-      command = command
-        .videoFilters(
-          "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-        );
+      command = command.videoFilters(
+        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+      );
     }
 
     if (format === "1:1") {
-      command = command
-        .videoFilters(
-          "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
-        );
+      command = command.videoFilters(
+        "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+      );
     }
 
     if (format === "16:9") {
-      command = command
-        .videoFilters(
-          "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
-        );
+      command = command.videoFilters(
+        "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
+      );
     }
 
     command
+      .on("start", (commandLine) => {
+        console.log("FFmpeg:", commandLine);
+      })
       .on("end", resolve)
       .on("error", reject)
       .save(output);
   });
 }
 
-/* ----------------------------- */
-/* Download YouTube */
-/* ----------------------------- */
+/* ================================= */
+/* YOUTUBE DOWNLOAD */
+/* ================================= */
 
-async function downloadYouTube(url, outputBase) {
+async function downloadYouTube(url) {
+  const parsed = new URL(url);
+
   const allowedHosts = [
     "youtube.com",
     "www.youtube.com",
@@ -449,16 +284,19 @@ async function downloadYouTube(url, outputBase) {
     "m.youtube.com",
   ];
 
-  const parsed = new URL(url);
-
   if (!allowedHosts.includes(parsed.hostname)) {
     throw new Error("Only YouTube URLs are supported.");
   }
 
-  const output = `${outputBase}.%(ext)s`;
+  const base = path.join(
+    uploadsDir,
+    `youtube-${Date.now()}`
+  );
+
+  console.log("Downloading YouTube video...");
 
   await ytDlp(url, {
-    output,
+    output: `${base}.%(ext)s`,
     format: "best[height<=720]/best",
     mergeOutputFormat: "mp4",
     noPlaylist: true,
@@ -471,101 +309,158 @@ async function downloadYouTube(url, outputBase) {
   const files = fs
     .readdirSync(uploadsDir)
     .filter((file) =>
-      file.startsWith(path.basename(outputBase))
+      file.startsWith(path.basename(base))
     );
 
   if (!files.length) {
-    throw new Error("YouTube video was not downloaded.");
+    throw new Error(
+      "YouTube video could not be downloaded."
+    );
   }
 
   return path.join(uploadsDir, files[0]);
 }
 
-/* ----------------------------- */
-/* Analyze */
-/* ----------------------------- */
+/* ================================= */
+/* MAIN ANALYZE ENDPOINT */
+/* ================================= */
 
 app.post(
   "/api/analyze",
   upload.single("video"),
   async (req, res) => {
     let videoPath = null;
-    let audioPath = null;
 
     try {
-      const url = String(req.body?.url || "").trim();
+      const url = String(
+        req.body?.url || ""
+      ).trim();
 
       const numberOfClips = Math.min(
         15,
         Math.max(
           1,
-          parseInt(req.body?.numberOfClips || "5", 10)
+          parseInt(
+            req.body?.numberOfClips || "5",
+            10
+          )
         )
       );
 
-      const format = String(
-        req.body?.format || "9:16"
-      );
+      const format =
+        String(req.body?.format || "9:16");
+
+      console.log("Analyze request received.");
+
+      /* ----------------------------- */
+      /* VIDEO SOURCE */
+      /* ----------------------------- */
 
       if (req.file) {
+        console.log("Using uploaded video.");
         videoPath = req.file.path;
       } else if (url) {
-        const base = path.join(
-          uploadsDir,
-          `download-${Date.now()}`
-        );
-
-        videoPath = await downloadYouTube(
-          url,
-          base
-        );
+        console.log("Using YouTube URL.");
+        videoPath = await downloadYouTube(url);
       } else {
         return res.status(400).json({
-          error: "Upload a video or provide a YouTube URL.",
+          error:
+            "Upload a video or provide a YouTube URL.",
         });
       }
 
-      const duration = await getVideoDuration(
-        videoPath
+      /* ----------------------------- */
+      /* DURATION */
+      /* ----------------------------- */
+
+      const duration =
+        await getVideoDuration(videoPath);
+
+      console.log(
+        `Video duration: ${duration.toFixed(2)} seconds`
       );
 
-      audioPath = path.join(
-        uploadsDir,
-        `audio-${Date.now()}.wav`
-      );
+      /* ----------------------------- */
+      /* GEMINI */
+      /* ----------------------------- */
 
-      await extractAudio(
-        videoPath,
-        audioPath
-      );
+      const aiClips =
+        await analyzeVideoWithGemini(
+          videoPath,
+          numberOfClips
+        );
 
-      const segments = await transcribeAudio(
-        audioPath
-      );
+      const clips = aiClips
+        .map((clip) => ({
+          start: Math.max(
+            0,
+            Number(clip.start)
+          ),
+          end: Math.min(
+            duration,
+            Number(clip.end)
+          ),
+          score: Number(
+            clip.score || 0
+          ),
+          title:
+            String(
+              clip.title || "Clip"
+            ),
+          reason:
+            String(
+              clip.reason || ""
+            ),
+        }))
+        .filter((clip) => {
+          const length =
+            clip.end - clip.start;
 
-      const clips = await findBestClips(
-        segments,
-        numberOfClips,
-        duration
-      );
+          return (
+            clip.end > clip.start &&
+            length >= 20 &&
+            length <= 60
+          );
+        })
+        .sort(
+          (a, b) =>
+            b.score - a.score
+        )
+        .slice(
+          0,
+          numberOfClips
+        );
 
       if (!clips.length) {
         throw new Error(
-          "AI could not find suitable clips."
+          "Gemini could not find suitable clips."
         );
       }
 
+      /* ----------------------------- */
+      /* RENDER CLIPS */
+      /* ----------------------------- */
+
       const results = [];
 
-      for (let i = 0; i < clips.length; i++) {
+      for (
+        let i = 0;
+        i < clips.length;
+        i++
+      ) {
         const clip = clips[i];
 
         const outputName =
           `clip-${Date.now()}-${i + 1}.mp4`;
 
-        const outputPath = path.join(
-          outputsDir,
-          outputName
+        const outputPath =
+          path.join(
+            outputsDir,
+            outputName
+          );
+
+        console.log(
+          `Rendering clip ${i + 1}/${clips.length}`
         );
 
         await createClip(
@@ -590,14 +485,21 @@ app.post(
         });
       }
 
+      console.log(
+        `Finished ${results.length} clips.`
+      );
+
       return res.json({
         success: true,
-        ai: "gemini",
+        ai: "Gemini",
         duration,
         clips: results,
       });
     } catch (error) {
-      console.error(error);
+      console.error(
+        "ANALYZE ERROR:",
+        error
+      );
 
       return res.status(500).json({
         error:
@@ -606,7 +508,6 @@ app.post(
       });
     } finally {
       cleanup(videoPath);
-      cleanup(audioPath);
     }
   }
 );
